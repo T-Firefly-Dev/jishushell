@@ -3519,10 +3519,10 @@ _jishu_install_main() {
     ui_info "Logging to: ${JISHU_LOG_FILE}"
     detect_os
     detect_arch
-    ensure_macos_prerequisites
     show_install_plan --with-jishushell
     _prompt_install_confirm
     check_sudo
+    ensure_macos_prerequisites
     ensure_prerequisites
     run_install_components --with-jishushell
     local rc=$?
