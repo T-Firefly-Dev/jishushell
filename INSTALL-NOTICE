@@ -20,6 +20,17 @@ software bundled with or installed by this product.
   with its respective license terms, including any restrictions on
   commercial use, competitive offerings, or redistribution.
 
+  Xcode Command Line Tools (build tools for macOS)
+    URL     : https://www.apple.com/legal/sla/docs/xcode.pdf
+    License : Apple Xcode and Apple SDKs Agreement
+    Author  : Apple Inc.
+
+  Homebrew (package manager for macOS)
+    URL     : https://github.com/Homebrew/brew
+    License : BSD 2-Clause License
+              https://github.com/Homebrew/brew/blob/HEAD/LICENSE.txt
+    Author  : Homebrew contributors
+
   Docker Engine
     URL     : https://github.com/moby/moby
     License : Apache License, Version 2.0
