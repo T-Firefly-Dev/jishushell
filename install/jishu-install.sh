@@ -1104,7 +1104,8 @@ install_docker() {
             ui_info "Starting Colima VM (profile: ${_COLIMA_PROFILE})..."
             mkdir -p "${_COLIMA_HOME}"
             _colima start "${_COLIMA_PROFILE}" \
-                --vm-type vz --mount-type virtiofs --network-address \
+                --vm-type vz --mount-type virtiofs \
+                --network-host-addresses --arch aarch64 \
                 --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null \
                 || { ui_warn "colima start failed — run 'COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}' manually"; return 1; }
             export DOCKER_HOST="unix://${_COLIMA_SOCKET}"
@@ -1193,7 +1194,8 @@ _do_install_docker() {
         mkdir -p "${_COLIMA_HOME}"
         ui_info "Starting Colima VM (profile: ${_COLIMA_PROFILE})..."
         _colima start "${_COLIMA_PROFILE}" \
-            --vm-type vz --mount-type virtiofs --network-address \
+            --vm-type vz --mount-type virtiofs \
+            --network-host-addresses --arch aarch64 \
             --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null \
             || { ui_warn "colima start failed — run 'COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}' manually"; return 1; }
         ui_success "Colima is running"
@@ -1359,7 +1361,8 @@ _ensure_docker_running() {
             ui_info "Starting Colima VM..."
             mkdir -p "${_COLIMA_HOME}"
             if ! _colima start "${_COLIMA_PROFILE}" \
-                --vm-type vz --mount-type virtiofs --network-address \
+                --vm-type vz --mount-type virtiofs \
+                --network-host-addresses --arch aarch64 \
                 --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null; then
                 ui_warn "colima start failed"
                 ui_info "Run manually: COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}"
@@ -2180,6 +2183,12 @@ install_nomad_systemd() {
     local config_file="${nomad_config_dir}/nomad.hcl"
 
     if [[ "$OS" == "macos" ]]; then
+        # Install colima's launchd agent first so it is started at the next
+        # login alongside nomad (colima starts the VM, nomad's wrapper waits
+        # for it). Order of installation here doesn't change runtime order
+        # — both fire RunAtLoad — but we install colima first so the VM is
+        # up before we kickstart nomad below in run_install_components.
+        _install_colima_launchd
         _install_nomad_launchd
         return $?
     fi
@@ -2247,6 +2256,114 @@ WantedBy=multi-user.target"
     fi
 }
 
+# Colima launchd agent: auto-start the JishuShell Colima VM on user login.
+# Without this, after every Mac reboot the user has to run `colima start
+# jishushell` manually, and Nomad (started earlier by launchd) caches
+# docker.Healthy=False because docker is not yet reachable.
+_install_colima_launchd() {
+    local plist_label="com.jishushell.colima"
+    local plist_path="${HOME}/Library/LaunchAgents/${plist_label}.plist"
+    local log_path="${JISHUSHELL_HOME}/colima/colima-launchd.log"
+    local colima_bin
+    colima_bin="$(command -v colima 2>/dev/null || echo /opt/homebrew/bin/colima)"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        ui_info "[dry-run] Would install launchd agent: ${plist_path}"
+        return 0
+    fi
+
+    mkdir -p "${HOME}/Library/LaunchAgents" "${JISHUSHELL_HOME}/colima"
+
+    # `colima start` exits cleanly once the VM is up, so KeepAlive must be
+    # false — otherwise launchd restarts colima start in an infinite loop.
+    # The flags here mirror the ones jishushell itself uses on first install
+    # (network-host-addresses + arch aarch64), so a relaunched VM gets the
+    # same network config; --activate=false keeps the user's docker context
+    # selection in ~/.docker/config.json untouched.
+    cat > "$plist_path" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${plist_label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${colima_bin}</string>
+        <string>start</string>
+        <string>${_COLIMA_PROFILE}</string>
+        <string>--vm-type</string><string>vz</string>
+        <string>--mount-type</string><string>virtiofs</string>
+        <string>--network-host-addresses</string>
+        <string>--arch</string><string>aarch64</string>
+        <string>--activate=false</string>
+        <string>--cpu</string><string>2</string>
+        <string>--memory</string><string>4</string>
+        <string>--disk</string><string>60</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>COLIMA_HOME</key>
+        <string>${_COLIMA_HOME}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>${log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>${log_path}</string>
+</dict>
+</plist>
+PLIST
+
+    launchctl unload "$plist_path" 2>/dev/null || true
+    if launchctl load -w "$plist_path" 2>/dev/null; then
+        ui_success "Colima launchd agent installed (auto-start at login)"
+    else
+        ui_warn "Could not load colima launchd agent"
+    fi
+}
+
+# Wrapper script that nomad's launchd plist invokes. Polls the JishuShell
+# private docker socket (i.e. waits for Colima to be ready) before exec'ing
+# the real `nomad agent`. Without this gate, after a Mac reboot the OS
+# launches every LaunchAgent in parallel, nomad starts before colima
+# finishes booting, the docker driver fingerprint ends up Healthy=False,
+# and that bad cache survives until something restarts nomad — leaving
+# every job stuck in `pending` with `missing drivers: 1`.
+_install_nomad_wait_docker_wrapper() {
+    local wrapper="${JISHUSHELL_BIN_DIR}/nomad-launchd-wrapper.sh"
+    local nomad_bin="${JISHUSHELL_BIN_DIR}/nomad"
+    local config_file="${JISHUSHELL_HOME}/nomad/nomad.hcl"
+    local docker_sock="${_COLIMA_SOCKET}"
+
+    mkdir -p "${JISHUSHELL_BIN_DIR}"
+    cat > "$wrapper" << WRAPPER
+#!/bin/bash
+# Auto-generated by jishu-install.sh — do not edit by hand.
+# Wait for the JishuShell Colima docker socket to come up, then exec nomad.
+export DOCKER_HOST="unix://${docker_sock}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+deadline=\$(( \$(date +%s) + 180 ))
+while ! /usr/bin/env docker info >/dev/null 2>&1; do
+  if [ \$(date +%s) -ge \$deadline ]; then
+    echo "[nomad-launchd-wrapper] timed out waiting for docker after 180s; starting nomad anyway" >&2
+    break
+  fi
+  sleep 2
+done
+
+exec "${nomad_bin}" agent -config="${config_file}"
+WRAPPER
+    chmod 755 "$wrapper"
+    echo "$wrapper"
+}
+
 _install_nomad_launchd() {
     local nomad_bin="${JISHUSHELL_BIN_DIR}/nomad"
     local nomad_config_dir="${JISHUSHELL_HOME}/nomad"
@@ -2267,6 +2384,11 @@ _install_nomad_launchd() {
     # pick the wrong socket (Docker Desktop or /var/run/docker.sock).
     local docker_sock="${_COLIMA_SOCKET}"
 
+    # Wrap nomad in a docker-readiness gate so boot ordering doesn't poison
+    # the docker driver fingerprint. See _install_nomad_wait_docker_wrapper.
+    local nomad_wrapper
+    nomad_wrapper="$(_install_nomad_wait_docker_wrapper)"
+
     cat > "$plist_path" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2276,9 +2398,7 @@ _install_nomad_launchd() {
     <string>${plist_label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${nomad_bin}</string>
-        <string>agent</string>
-        <string>-config=${config_file}</string>
+        <string>${nomad_wrapper}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -3101,6 +3221,26 @@ run_install_components() {
         ui_warn "Skipped — Docker is not available (installation failed or not installed)"
     fi
 
+    # Once docker is verified working (Colima up + image pulled on macOS,
+    # native daemon up on Linux), bounce Nomad so its docker driver
+    # fingerprint is fresh. Without this, Nomad — which `install_nomad`
+    # started above before docker was reachable on macOS — keeps a cached
+    # `docker.Healthy=False` and rejects every job with `missing drivers:1`
+    # until something restarts it. Belt-and-suspenders with the wrapper
+    # script in _install_nomad_launchd: covers install-time as well as
+    # the boot-time path.
+    if [[ $docker_ok -eq 1 && $SKIP_NOMAD -eq 0 ]]; then
+        if [[ "$OS" == "macos" ]]; then
+            launchctl kickstart -k "gui/$(id -u)/com.jishushell.nomad" 2>/dev/null \
+                && ui_info "Restarted Nomad to refresh docker driver fingerprint" \
+                || true
+        elif command -v systemctl &>/dev/null && systemctl is-enabled nomad &>/dev/null 2>&1; then
+            ${SUDO} systemctl restart nomad 2>/dev/null \
+                && ui_info "Restarted Nomad to refresh docker driver fingerprint" \
+                || true
+        fi
+    fi
+
     if [[ $with_jishushell -eq 1 ]]; then
         if [[ $SKIP_JISHUSHELL -eq 1 ]]; then
             ui_stage "JishuShell"
@@ -3132,8 +3272,15 @@ run_install_components() {
         ${SUDO} find "${JISHUSHELL_HOME}" -type f -exec chmod 644 {} + 2>/dev/null || true
         # Executables in bin/ must keep the execute bit
         ${SUDO} find "${JISHUSHELL_BIN_DIR}" -type f -exec chmod 755 {} + 2>/dev/null || true
-        # Sensitive files: owner-only read (600)
-        for f in auth.json jwt-secret panel.json nomad.env encryption-key; do
+        # Sensitive files: owner-only read (600). The find above blanket-set
+        # 644 on every file under JISHUSHELL_HOME, including secrets — restore
+        # them here. MUST include the Colima/lima VM SSH private key:
+        # OpenSSH refuses any key with group/world-readable perms ("bad
+        # permissions"), so a 644 key file makes lima hostagent unable to
+        # provision the VM (host-addresses + docker context never come up),
+        # docker containers ship empty Ports{}, and the panel proxy 502s.
+        for f in auth.json jwt-secret panel.json nomad.env encryption-key \
+                 colima/_lima/_config/user; do
             local fp="${JISHUSHELL_HOME}/${f}"
             [[ -f "$fp" ]] && ${SUDO} chmod 600 "$fp" 2>/dev/null || true
         done
