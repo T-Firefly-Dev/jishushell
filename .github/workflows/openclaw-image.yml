@@ -98,8 +98,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:slim
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          no-cache: true
           labels: |
             org.opencontainers.image.title=OpenClaw Runtime
             org.opencontainers.image.description=Self-contained OpenClaw runtime with Python and version-switch entrypoint
