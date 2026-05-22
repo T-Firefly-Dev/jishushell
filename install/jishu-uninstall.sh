@@ -38,6 +38,22 @@ JISHUSHELL_HOME="${JISHUSHELL_HOME:-${USER_HOME}/.jishushell}"
 _COLIMA_HOME="${JISHUSHELL_HOME}/colima"
 _COLIMA_PROFILE="jishushell"
 
+# colima binary: prefer PATH, fall back to both Homebrew prefixes.
+# Mirrors install/jishu-install.sh — non-interactive shells (launchd,
+# sshd without a login profile) often lack /opt/homebrew/bin in PATH,
+# so a bare `command colima` fails even when colima is installed.
+COLIMA_BIN="$(command -v colima 2>/dev/null || true)"
+[[ -z "$COLIMA_BIN" && -x /opt/homebrew/bin/colima ]] && COLIMA_BIN="/opt/homebrew/bin/colima"
+[[ -z "$COLIMA_BIN" && -x /usr/local/bin/colima ]] && COLIMA_BIN="/usr/local/bin/colima"
+COLIMA_BIN_FOUND=1
+[[ -z "$COLIMA_BIN" ]] && COLIMA_BIN_FOUND=0 && COLIMA_BIN="colima"
+DOCKER_BIN="$(PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:${PATH}}" command -v docker 2>/dev/null || true)"
+[[ -z "$DOCKER_BIN" && -x /opt/homebrew/bin/docker ]] && DOCKER_BIN="/opt/homebrew/bin/docker"
+[[ -z "$DOCKER_BIN" && -x /usr/local/bin/docker ]] && DOCKER_BIN="/usr/local/bin/docker"
+DOCKER_BIN_FOUND=1
+[[ -z "$DOCKER_BIN" ]] && DOCKER_BIN_FOUND=0 && DOCKER_BIN="docker"
+COLIMA_STD_PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 BOLD='\033[1m'
 ACCENT='\033[38;2;66;135;245m'
 INFO='\033[38;2;136;146;176m'
@@ -250,7 +266,14 @@ wait_for_apt_lock() {
 }
 
 _colima() {
-    COLIMA_HOME="${_COLIMA_HOME}" command colima "$@"
+    PATH="${COLIMA_STD_PATH}${PATH:+:${PATH}}" \
+        COLIMA_HOME="${_COLIMA_HOME}" \
+        "${COLIMA_BIN:-colima}" "$@"
+}
+
+_docker() {
+    PATH="${COLIMA_STD_PATH}${PATH:+:${PATH}}" \
+        "${DOCKER_BIN:-docker}" "$@"
 }
 
 # ─── Argument parsing ─────────────────────────────────────────────────────────
@@ -336,7 +359,7 @@ stop_services() {
     ui_section "Stopping services and removing auto-start"
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        ui_info "[dry-run] Would stop and deregister: com.jishushell.panel, com.jishushell.nomad"
+        ui_info "[dry-run] Would stop and deregister: com.jishushell.panel, com.jishushell.nomad, com.jishushell.colima"
         ui_info "[dry-run] Would: npm uninstall -g jishushell"
         if [[ "$OS" == "macos" ]]; then
             ui_info "[dry-run] Would: kill stale colima/limactl/ssh processes for profile ${_COLIMA_PROFILE}"
@@ -350,6 +373,7 @@ stop_services() {
     if [[ "$(uname -s)" == "Darwin" ]]; then
         local panel_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.panel.plist"
         local nomad_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.nomad.plist"
+        local colima_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.colima.plist"
 
         if launchctl list 2>/dev/null | grep -q "com.jishushell.panel"; then
             ui_info "Stopping JishuShell panel..."
@@ -375,6 +399,22 @@ stop_services() {
         if [[ -f "$nomad_plist" ]]; then
             rm -f "$nomad_plist"
             ui_success "Removed: ${nomad_plist}"
+        fi
+
+        # Colima self-retrying launchd agent (added by the colima-headless-autostart
+        # branch). Must unload before colima delete below — otherwise launchd will
+        # immediately try to restart the just-deleted profile.
+        if launchctl list 2>/dev/null | grep -q "com.jishushell.colima"; then
+            ui_info "Stopping Colima launchd agent..."
+            launchctl unload -w "$colima_plist" 2>/dev/null || true
+            ui_success "Colima launchd agent stopped and removed from auto-start"
+        else
+            ui_info "Colima launchd agent is not running"
+        fi
+
+        if [[ -f "$colima_plist" ]]; then
+            rm -f "$colima_plist"
+            ui_success "Removed: ${colima_plist}"
         fi
     else
         if command -v systemctl &>/dev/null; then
@@ -440,7 +480,7 @@ stop_services() {
         _kill_jishu_procs "ssh.*colima-${_COLIMA_PROFILE}"
 
         # Graceful stop + delete via colima CLI
-        if command -v colima &>/dev/null; then
+        if [[ "$COLIMA_BIN_FOUND" == "1" ]]; then
             if _colima list 2>/dev/null | grep -q "${_COLIMA_PROFILE}"; then
                 ui_info "Stopping Colima VM (profile: ${_COLIMA_PROFILE})..."
                 _colima stop "${_COLIMA_PROFILE}" 2>/dev/null || true
@@ -455,8 +495,8 @@ stop_services() {
         fi
 
         # Safety net: remove docker context
-        if command -v docker &>/dev/null; then
-            docker context rm "colima-${_COLIMA_PROFILE}" 2>/dev/null || true
+        if [[ "$DOCKER_BIN_FOUND" == "1" ]]; then
+            _docker context rm "colima-${_COLIMA_PROFILE}" 2>/dev/null || true
         fi
 
         # Clean leaked ~/.colima directory (Colima stat-guard artifact)

@@ -178,11 +178,8 @@ RUN mkdir -p /opt/data && \
 COPY templates/hermes-entrypoint.sh /usr/local/bin/jishushell-hermes-entry.sh
 RUN chmod 0755 /usr/local/bin/jishushell-hermes-entry.sh
 
-# Advertise the protocol contract this image satisfies. The panel reads
-# this label via `docker inspect` before launching an instance; a panel
-# that only knows protocol version N refuses to start an image that
-# declares N+1, which is how we gate rolling upgrades without silent
-# behavioral drift.
+# Retained as build metadata for operators and registry inspection. Runtime
+# readiness is determined from the official ghcr.io RepoDigest, not this label.
 LABEL runtime.protocol.version="1"
 
 # Zombie reaping is handled by Nomad's `init: true` flag (docker-init

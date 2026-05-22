@@ -239,6 +239,9 @@ AUTO_YES="${AUTO_YES:-0}"
 DOCKER_CMD_PREFIX=""          # Set to "sg docker -c" when group activated via sg
 DOCKER_GROUP_JUST_ADDED=0     # 1 if usermod was called this run
 DOCKER_USE_SUDO=0             # 1 if sudo docker should be used as fallback
+ENABLE_AUTOLOGIN="${ENABLE_AUTOLOGIN:-0}"   # opt-in: writes /etc/kcpassword
+NO_AUTOLOGIN=0                              # explicit --no-autologin override
+AUTOLOGIN_PASSWORD="${AUTOLOGIN_PASSWORD:-}"  # env-overridable; or --autologin-password
 
 PKG_UPDATED=0
 
@@ -1088,7 +1091,7 @@ install_docker() {
         local need_brew=0
         local need_profile=0
 
-        if ! command -v docker &>/dev/null || ! command -v colima &>/dev/null; then
+        if [[ "$DOCKER_BIN_FOUND" != "1" || "$COLIMA_BIN_FOUND" != "1" ]]; then
             need_brew=1
             need_profile=1
         elif ! _colima list 2>/dev/null | grep -q "${_COLIMA_PROFILE}"; then
@@ -1104,8 +1107,8 @@ install_docker() {
             ui_info "Starting Colima VM (profile: ${_COLIMA_PROFILE})..."
             mkdir -p "${_COLIMA_HOME}"
             _colima start "${_COLIMA_PROFILE}" \
-                --vm-type vz --mount-type virtiofs \
-                --network-host-addresses --arch aarch64 \
+                --vm-type "${COLIMA_VM_TYPE}" --mount-type virtiofs \
+                --network-host-addresses --arch "${COLIMA_ARCH}" \
                 --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null \
                 || { ui_warn "colima start failed — run 'COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}' manually"; return 1; }
             export DOCKER_HOST="unix://${_COLIMA_SOCKET}"
@@ -1179,7 +1182,11 @@ install_docker() {
 
 _do_install_docker() {
     if [[ "$DRY_RUN" == "1" ]]; then
-        ui_info "[dry-run] Would install Docker via get.docker.com"
+        if [[ "$OS" == "macos" ]]; then
+            ui_info "[dry-run] Would install docker and colima via Homebrew"
+        else
+            ui_info "[dry-run] Would install Docker via get.docker.com"
+        fi
         return 0
     fi
 
@@ -1194,8 +1201,8 @@ _do_install_docker() {
         mkdir -p "${_COLIMA_HOME}"
         ui_info "Starting Colima VM (profile: ${_COLIMA_PROFILE})..."
         _colima start "${_COLIMA_PROFILE}" \
-            --vm-type vz --mount-type virtiofs \
-            --network-host-addresses --arch aarch64 \
+            --vm-type "${COLIMA_VM_TYPE}" --mount-type virtiofs \
+            --network-host-addresses --arch "${COLIMA_ARCH}" \
             --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null \
             || { ui_warn "colima start failed — run 'COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}' manually"; return 1; }
         ui_success "Colima is running"
@@ -1357,12 +1364,12 @@ _ensure_docker_running() {
 
     if [[ "$OS" == "macos" ]]; then
         export DOCKER_HOST="unix://${_COLIMA_SOCKET}"
-        if ! docker info &>/dev/null 2>&1; then
+        if ! _docker info &>/dev/null 2>&1; then
             ui_info "Starting Colima VM..."
             mkdir -p "${_COLIMA_HOME}"
             if ! _colima start "${_COLIMA_PROFILE}" \
-                --vm-type vz --mount-type virtiofs \
-                --network-host-addresses --arch aarch64 \
+                --vm-type "${COLIMA_VM_TYPE}" --mount-type virtiofs \
+                --network-host-addresses --arch "${COLIMA_ARCH}" \
                 --activate=false --cpu 2 --memory 4 --disk 60 >/dev/null; then
                 ui_warn "colima start failed"
                 ui_info "Run manually: COLIMA_HOME=${_COLIMA_HOME} colima start ${_COLIMA_PROFILE}"
@@ -1371,7 +1378,7 @@ _ensure_docker_running() {
         fi
         local waited=0
         local timeout=120
-        while ! docker info &>/dev/null 2>&1; do
+        while ! _docker info &>/dev/null 2>&1; do
             if [[ $waited -ge $timeout ]]; then
                 ui_warn "Docker daemon did not become ready within ${timeout} seconds"
                 ui_info "Run: COLIMA_HOME=${_COLIMA_HOME} colima status ${_COLIMA_PROFILE}"
@@ -1526,9 +1533,47 @@ docker_exec() {
 _COLIMA_HOME="${JISHUSHELL_HOME}/colima"
 _COLIMA_PROFILE="jishushell"
 _COLIMA_SOCKET="${_COLIMA_HOME}/${_COLIMA_PROFILE}/docker.sock"
+# jishushell on macOS supports Apple Silicon (arm64) ONLY. Fail fast on
+# Intel/other so third-party users get a clear message instead of an
+# obscure colima failure. NOTE: $OS is not set yet at script-load time
+# (detect_os runs later), so gate on `uname -s` directly, not $OS.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    case "$(uname -m)" in
+        arm64|aarch64) : ;;
+        *)
+            ui_error "jishushell on macOS supports Apple Silicon (arm64) only — detected $(uname -m). Installation aborted."
+            exit 1
+            ;;
+    esac
+fi
+COLIMA_ARCH="aarch64"
+COLIMA_VM_TYPE="vz"
+# colima binary: prefer PATH, fall back to both Homebrew prefixes.
+COLIMA_BIN="$(command -v colima 2>/dev/null || true)"
+[[ -z "$COLIMA_BIN" && -x /opt/homebrew/bin/colima ]] && COLIMA_BIN="/opt/homebrew/bin/colima"
+[[ -z "$COLIMA_BIN" && -x /usr/local/bin/colima ]] && COLIMA_BIN="/usr/local/bin/colima"
+COLIMA_BIN_FOUND=1
+[[ -z "$COLIMA_BIN" ]] && COLIMA_BIN_FOUND=0 && COLIMA_BIN="colima"
+DOCKER_BIN="$(PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:${PATH}}" command -v docker 2>/dev/null || true)"
+[[ -z "$DOCKER_BIN" && -x /opt/homebrew/bin/docker ]] && DOCKER_BIN="/opt/homebrew/bin/docker"
+[[ -z "$DOCKER_BIN" && -x /usr/local/bin/docker ]] && DOCKER_BIN="/usr/local/bin/docker"
+DOCKER_BIN_FOUND=1
+[[ -z "$DOCKER_BIN" ]] && DOCKER_BIN_FOUND=0 && DOCKER_BIN="docker"
+COLIMA_STD_PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 _colima() {
-    COLIMA_HOME="${_COLIMA_HOME}" command colima "$@"
+    # Use the resolved COLIMA_BIN path — non-interactive shells (launchd
+    # wrappers, sshd) routinely lack /opt/homebrew/bin in PATH, so a bare
+    # `command colima` falls back to "not found" even when colima is fully
+    # installed at /opt/homebrew/bin/colima.
+    PATH="${COLIMA_STD_PATH}${PATH:+:${PATH}}" \
+        COLIMA_HOME="${_COLIMA_HOME}" \
+        "${COLIMA_BIN:-colima}" "$@"
+}
+
+_docker() {
+    PATH="${COLIMA_STD_PATH}${PATH:+:${PATH}}" \
+        "${DOCKER_BIN:-docker}" "$@"
 }
 
 # ─── 3. Nomad ────────────────────────────────────────────────────────────────
@@ -2073,6 +2118,9 @@ ${external_host_network_block}
 plugin "docker" {
   config {
     disable_log_collection = true
+        gc {
+            image = false
+        }
     volumes {
       enabled = true
     }
@@ -2260,12 +2308,86 @@ WantedBy=multi-user.target"
 # Without this, after every Mac reboot the user has to run `colima start
 # jishushell` manually, and Nomad (started earlier by launchd) caches
 # docker.Healthy=False because docker is not yet reachable.
+# Wrapper invoked by the colima launchd plist. Serializes concurrent
+# starts, waits for the network, clears unclean-shutdown residue WITHOUT
+# deleting the VM, then retries `colima start` until the managed docker
+# socket answers. Mirrors _install_nomad_wait_docker_wrapper's style.
+_install_colima_wait_start_wrapper() {
+    local wrapper="${JISHUSHELL_BIN_DIR}/colima-launchd-wrapper.sh"
+    mkdir -p "${JISHUSHELL_BIN_DIR}"
+    cat > "$wrapper" << WRAPPER
+#!/bin/bash
+# Auto-generated by jishu-install.sh — do not edit by hand.
+set -u
+export COLIMA_HOME="${_COLIMA_HOME}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+COLIMA_BIN="${COLIMA_BIN}"
+PROFILE="${_COLIMA_PROFILE}"
+SOCK="${_COLIMA_SOCKET}"
+LOCKDIR="${_COLIMA_HOME}/.colima-launchd.lock.d"
+
+# Ensure the colima home exists (launchd runs us at boot, independently).
+mkdir -p "\$COLIMA_HOME"
+
+# Reclaim a stale lock orphaned by SIGKILL/power-cut (mkdir-lock has no
+# owner; rmdir only removes it if still empty — safe).
+[ -d "\$LOCKDIR" ] && find "\$LOCKDIR" -maxdepth 0 -type d -mmin +10 -exec rmdir {} \\; 2>/dev/null || true
+
+# Single-flight via atomic mkdir (POSIX-atomic, dependency-free, stock macOS
+# compatible). If the lock dir already exists, another start is in progress —
+# exit 0.
+if ! mkdir "\$LOCKDIR" 2>/dev/null; then
+  echo "[colima-wrapper] another start in progress; exiting" >&2
+  exit 0
+fi
+trap 'rmdir "\$LOCKDIR" 2>/dev/null || true' EXIT
+
+docker_ok() { DOCKER_HOST="unix://\$SOCK" /usr/bin/env docker info >/dev/null 2>&1; }
+
+# Already up → idempotent no-op.
+if docker_ok; then echo "[colima-wrapper] docker already reachable" >&2; exit 0; fi
+
+# Wait up to 60s for the network (--network-host-addresses needs en0 up).
+net_deadline=\$(( \$(date +%s) + 60 ))
+while ! /sbin/ifconfig en0 2>/dev/null | grep -q "inet "; do
+  [ \$(date +%s) -ge \$net_deadline ] && break
+  sleep 2
+done
+
+# Unclean-shutdown residue: stop a half-broken VM, but NEVER delete it
+# (delete destroys the openclaw image and all VM data).
+status="\$("\$COLIMA_BIN" status "\$PROFILE" 2>&1 || true)"
+if echo "\$status" | grep -qiE 'broken|cannot|error'; then
+  echo "[colima-wrapper] stale state detected; stopping (never deleting)" >&2
+  "\$COLIMA_BIN" stop "\$PROFILE" >/dev/null 2>&1 || true
+fi
+
+# Retry start with backoff until docker answers (~5 attempts).
+attempt=0
+while [ \$attempt -lt 5 ]; do
+  # Refresh our own lock mtime each attempt so a long (>budget) legit
+  # start is never reclaimed as stale by a concurrent launchd fire.
+  touch "\$LOCKDIR" 2>/dev/null || true
+  attempt=\$(( attempt + 1 ))
+  echo "[colima-wrapper] colima start attempt \$attempt" >&2
+  "\$COLIMA_BIN" start "\$PROFILE" \\
+    --vm-type ${COLIMA_VM_TYPE} --mount-type virtiofs \\
+    --network-host-addresses --arch ${COLIMA_ARCH} --activate=false \\
+    --cpu 2 --memory 4 --disk 60 >/dev/null 2>&1 || true
+  docker_ok && { echo "[colima-wrapper] docker reachable" >&2; exit 0; }
+  sleep \$(( attempt * 10 ))
+done
+echo "[colima-wrapper] exhausted retries; docker still unreachable" >&2
+exit 1
+WRAPPER
+    chmod 755 "$wrapper"
+    echo "$wrapper"
+}
+
 _install_colima_launchd() {
     local plist_label="com.jishushell.colima"
     local plist_path="${HOME}/Library/LaunchAgents/${plist_label}.plist"
     local log_path="${JISHUSHELL_HOME}/colima/colima-launchd.log"
-    local colima_bin
-    colima_bin="$(command -v colima 2>/dev/null || echo /opt/homebrew/bin/colima)"
 
     if [[ "$DRY_RUN" == "1" ]]; then
         ui_info "[dry-run] Would install launchd agent: ${plist_path}"
@@ -2274,12 +2396,9 @@ _install_colima_launchd() {
 
     mkdir -p "${HOME}/Library/LaunchAgents" "${JISHUSHELL_HOME}/colima"
 
-    # `colima start` exits cleanly once the VM is up, so KeepAlive must be
-    # false — otherwise launchd restarts colima start in an infinite loop.
-    # The flags here mirror the ones jishushell itself uses on first install
-    # (network-host-addresses + arch aarch64), so a relaunched VM gets the
-    # same network config; --activate=false keeps the user's docker context
-    # selection in ~/.docker/config.json untouched.
+    local colima_wrapper
+    colima_wrapper="$(_install_colima_wait_start_wrapper)"
+
     cat > "$plist_path" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2289,17 +2408,7 @@ _install_colima_launchd() {
     <string>${plist_label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${colima_bin}</string>
-        <string>start</string>
-        <string>${_COLIMA_PROFILE}</string>
-        <string>--vm-type</string><string>vz</string>
-        <string>--mount-type</string><string>virtiofs</string>
-        <string>--network-host-addresses</string>
-        <string>--arch</string><string>aarch64</string>
-        <string>--activate=false</string>
-        <string>--cpu</string><string>2</string>
-        <string>--memory</string><string>4</string>
-        <string>--disk</string><string>60</string>
+        <string>${colima_wrapper}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -2311,7 +2420,12 @@ _install_colima_launchd() {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>${log_path}</string>
     <key>StandardErrorPath</key>
@@ -2322,7 +2436,7 @@ PLIST
 
     launchctl unload "$plist_path" 2>/dev/null || true
     if launchctl load -w "$plist_path" 2>/dev/null; then
-        ui_success "Colima launchd agent installed (auto-start at login)"
+        ui_success "Colima launchd agent installed (self-retrying, auto-start at login)"
     else
         ui_warn "Could not load colima launchd agent"
     fi
@@ -3065,6 +3179,26 @@ install_jishushell_service() {
         local plist_label="com.jishushell.panel"
         local plist_path="${HOME}/Library/LaunchAgents/${plist_label}.plist"
 
+        local panel_gate="${JISHUSHELL_BIN_DIR}/panel-launchd-wrapper.sh"
+        mkdir -p "${JISHUSHELL_BIN_DIR}"
+        cat > "$panel_gate" << PANELGATE
+#!/bin/bash
+set -u
+# Auto-generated by jishu-install.sh — do not edit by hand.
+# Lightweight 60s docker-readiness gate so the first post-reboot page
+# load doesn't flash "image missing". Panel self-heals afterward, so on
+# timeout we start anyway (the UI must be observable).
+PANEL_DOCKER_WAIT_DEADLINE=60
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+deadline=\$(( \$(date +%s) + \$PANEL_DOCKER_WAIT_DEADLINE ))
+while ! DOCKER_HOST="unix://${_COLIMA_SOCKET}" /usr/bin/env docker info >/dev/null 2>&1; do
+  [ \$(date +%s) -ge \$deadline ] && { echo "[panel-gate] docker not ready after 60s; starting anyway" >&2; break; }
+  sleep 2
+done
+exec "${wrapper}" serve
+PANELGATE
+        chmod 755 "$panel_gate"
+
         mkdir -p "${HOME}/Library/LaunchAgents"
         cat > "$plist_path" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -3075,8 +3209,7 @@ install_jishushell_service() {
     <string>${plist_label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${wrapper}</string>
-        <string>serve</string>
+        <string>${panel_gate}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -3096,6 +3229,7 @@ PLIST
         else
             ui_warn "Could not load jishushell launchd agent"
         fi
+        _enable_autologin
         return 0
     fi
 
@@ -3120,7 +3254,11 @@ Environment=HOME=${REAL_HOME}
 Environment=JISHUSHELL_HOME=${JISHUSHELL_HOME}
 ProtectSystem=strict
 PrivateTmp=true
-ReadWritePaths=${JISHUSHELL_HOME} /etc/jishushell
+# /usr/local is whitelisted so app lifecycle scripts (e.g. ollama install.sh,
+# which writes /usr/local/bin/ollama and /usr/local/lib/ollama/) can succeed
+# even when the panel runs under ProtectSystem=strict. The rest of /usr stays
+# read-only.
+ReadWritePaths=${JISHUSHELL_HOME} /etc/jishushell /usr/local
 
 [Install]
 WantedBy=multi-user.target"
@@ -3296,6 +3434,69 @@ run_install_components() {
     return $has_error
 }
 
+# Opt-in macOS auto-login so headless boxes get a GUI (Aqua) session that
+# fires the colima/nomad/panel LaunchAgents after a reboot. Writes the
+# user's login password (kcpassword-obfuscated) to /etc/kcpassword — a
+# security-sensitive, explicitly-gated action. Skipped if FileVault is on
+# (mutually exclusive) and never run without consent.
+_enable_autologin() {
+    [[ "$OS" != "macos" ]] && return 0
+    if [[ "$NO_AUTOLOGIN" == "1" ]]; then
+        ui_info "Auto-login skipped (--no-autologin)"
+        return 0
+    fi
+    if [[ "$ENABLE_AUTOLOGIN" != "1" ]]; then
+        ui_warn "Auto-login NOT enabled. On a headless Mac the LaunchAgents only"
+        ui_warn "fire after a GUI login. Enable later with:"
+        ui_warn "  bash jishu-install.sh --run 6 --enable-autologin"
+        return 0
+    fi
+    if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+        ui_warn "FileVault is ON — auto-login is incompatible and will be skipped."
+        ui_warn "Disable FileVault or log in at the GUI after each reboot."
+        return 0
+    fi
+
+    local pw="$AUTOLOGIN_PASSWORD"
+    if [[ -z "$pw" ]]; then
+        if [[ "$AUTO_YES" == "1" ]]; then
+            ui_warn "Auto-login requested but no password (use --autologin-password); skipping"
+            return 0
+        fi
+        read -r -s -p "Login password for ${REAL_USER} (for auto-login, not stored in logs): " pw
+        echo ""
+    fi
+    [[ -z "$pw" ]] && { ui_warn "Empty password; auto-login skipped"; return 0; }
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        ui_info "[dry-run] Would set autoLoginUser=${REAL_USER} and write /etc/kcpassword"
+        return 0
+    fi
+
+    ${SUDO} defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser "${REAL_USER}"
+
+    # kcpassword cipher (classic 11-byte key, repeated). Password is XOR'd
+    # byte-wise; the buffer is padded with cipher bytes to a multiple of 12,
+    # adding a full 12-byte block when the length is already a multiple.
+    local cipher=(0x7D 0x89 0x52 0x23 0xD2 0xBC 0xDD 0xEA 0xA3 0xB9 0x1F)
+    local out="" i ch ck
+    local len=${#pw}
+    local total=$(( (len / 12 + 1) * 12 ))
+    for (( i=0; i<total; i++ )); do
+        ck=$(( cipher[i % 11] ))
+        if (( i < len )); then
+            printf -v ch '%d' "'${pw:i:1}"
+        else
+            ch=0
+        fi
+        out+=$(printf '\\x%02x' $(( ch ^ ck )))
+    done
+    ( umask 077; printf "%b" "$out" | ${SUDO} tee /etc/kcpassword >/dev/null )
+    ${SUDO} chmod 600 /etc/kcpassword
+    unset pw
+    ui_success "Auto-login enabled for ${REAL_USER} (headless reboot will fire LaunchAgents)"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Installer entry point — argument parsing, banner, main
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3366,6 +3567,12 @@ parse_args() {
                     exit 1
                 fi
                 ;;
+            --enable-autologin)        ENABLE_AUTOLOGIN=1 ;;
+            --no-autologin)            NO_AUTOLOGIN=1 ;;
+            --autologin-password)
+                shift
+                AUTOLOGIN_PASSWORD="${1:?--autologin-password requires a value}"
+                ;;
             --yes|-y)                  AUTO_YES=1 ;;
             --help|-h)        usage; exit 0 ;;
             *)                ui_warn "Unknown argument: $1" ;;
@@ -3399,6 +3606,11 @@ Options:
                                                          (e.g. --jishushell-version 0.4.9)
   --registry <url>           Use a custom npm registry for all installs
                              (e.g. --registry http://127.0.0.1:4873/)
+  --enable-autologin         Enable macOS auto-login (headless reboot support;
+                             writes /etc/kcpassword — security-sensitive, opt-in)
+  --no-autologin             Never configure auto-login (overrides --enable-autologin)
+  --autologin-password <pw>  Password for non-interactive auto-login setup
+                             (visible in 'ps'; prefer AUTOLOGIN_PASSWORD env var)
   --yes, -y                  Skip all confirmation prompts
   --help, -h                 Show this help message
 
