@@ -359,8 +359,8 @@ stop_services() {
     ui_section "Stopping services and removing auto-start"
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        ui_info "[dry-run] Would stop and deregister: com.jishushell.panel, com.jishushell.nomad, com.jishushell.colima"
-        ui_info "[dry-run] Would: npm uninstall -g jishushell"
+        ui_info "[dry-run] Would stop and deregister: com.jishushell.core, com.jishushell.panel, com.jishushell.nomad, com.jishushell.colima"
+        ui_info "[dry-run] Would: npm uninstall -g jishushell-gui and/or jishushell and/or jishushell-panel"
         if [[ "$OS" == "macos" ]]; then
             ui_info "[dry-run] Would: kill stale colima/limactl/ssh processes for profile ${_COLIMA_PROFILE}"
             ui_info "[dry-run] Would: COLIMA_HOME=${_COLIMA_HOME} colima stop ${_COLIMA_PROFILE}"
@@ -371,16 +371,30 @@ stop_services() {
     fi
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
+        local core_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.core.plist"
         local panel_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.panel.plist"
         local nomad_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.nomad.plist"
         local colima_plist="${USER_HOME}/Library/LaunchAgents/com.jishushell.colima.plist"
 
-        if launchctl list 2>/dev/null | grep -q "com.jishushell.panel"; then
-            ui_info "Stopping JishuShell panel..."
-            launchctl unload -w "$panel_plist" 2>/dev/null || true
-            ui_success "JishuShell panel stopped and removed from auto-start"
+        if launchctl list 2>/dev/null | grep -q "com.jishushell.core"; then
+            ui_info "Stopping JishuShell core..."
+            launchctl unload -w "$core_plist" 2>/dev/null || true
+            ui_success "JishuShell core stopped and removed from auto-start"
         else
-            ui_info "JishuShell panel is not running"
+            ui_info "JishuShell core is not running"
+        fi
+
+        if [[ -f "$core_plist" ]]; then
+            rm -f "$core_plist"
+            ui_success "Removed: ${core_plist}"
+        fi
+
+        if launchctl list 2>/dev/null | grep -q "com.jishushell.panel"; then
+            ui_info "Stopping JishuShell Panel..."
+            launchctl unload -w "$panel_plist" 2>/dev/null || true
+            ui_success "JishuShell Panel stopped and removed from auto-start"
+        else
+            ui_info "JishuShell Panel is not running"
         fi
 
         if [[ -f "$panel_plist" ]]; then
@@ -418,7 +432,7 @@ stop_services() {
         fi
     else
         if command -v systemctl &>/dev/null; then
-            for svc in jishushell nomad; do
+            for svc in jishushell-panel jishushell nomad; do
                 if systemctl is-active --quiet "$svc" 2>/dev/null; then
                     ui_info "Stopping ${svc}..."
                     ${SUDO} systemctl stop "$svc" 2>/dev/null || true
@@ -434,10 +448,18 @@ stop_services() {
         fi
     fi
 
-    if command -v npm &>/dev/null && npm list -g jishushell &>/dev/null 2>&1; then
-        ui_info "Uninstalling jishushell npm package..."
-        npm uninstall -g jishushell 2>/dev/null || true
-        ui_success "jishushell npm package removed"
+    if command -v npm &>/dev/null; then
+        local _removed_npm_package=0
+        for pkg in jishushell-gui jishushell jishushell-panel; do
+            if npm list -g "$pkg" &>/dev/null 2>&1; then
+                ui_info "Uninstalling ${pkg} npm package..."
+                npm uninstall -g "$pkg" 2>/dev/null || true
+                _removed_npm_package=1
+            fi
+        done
+        if [[ "$_removed_npm_package" == "1" ]]; then
+            ui_success "JishuShell npm package(s) removed"
+        fi
     fi
 
     # Kill any nomad agent process started by jishushell (match our config path)
@@ -515,10 +537,15 @@ stop_services() {
         fi
     fi
 
-    local wrapper="${JISHUSHELL_HOME}/bin/jishushell-panel-start"
+    local wrapper="${JISHUSHELL_HOME}/bin/jishushell-core-start"
     if [[ -f "$wrapper" ]]; then
         rm -f "$wrapper"
         ui_success "Removed wrapper: ${wrapper}"
+    fi
+    local panel_wrapper="${JISHUSHELL_HOME}/bin/jishushell-panel-start"
+    if [[ -f "$panel_wrapper" ]]; then
+        rm -f "$panel_wrapper"
+        ui_success "Removed wrapper: ${panel_wrapper}"
     fi
 
     # Clean JishuShell PATH entries from shell RC files.
@@ -554,7 +581,7 @@ delete_data_dir() {
     size="$(du -sh "$jishu_home" 2>/dev/null | cut -f1 || echo "?")"
     echo ""
     ui_info "Data directory: ${jishu_home} (${size})"
-    ui_info "This contains your instances, config, Nomad data, and Colima data."
+    ui_info "This contains your apps, instances, config, secrets, Nomad data, and Colima data."
 
     if [[ "$DRY_RUN" == "1" ]]; then
         ui_info "[dry-run] Would: ${SUDO} rm -rf ${jishu_home}"
@@ -582,6 +609,7 @@ delete_data_dir() {
         ${SUDO} chflags -R nouchg,noschg "$jishu_home" 2>/dev/null || true
     fi
     ${SUDO} rm -rf "$jishu_home" || true
+    ${SUDO} rm -rf /etc/jishushell 2>/dev/null || true
     if [[ ! -d "$jishu_home" ]]; then
         ui_success "Data directory removed"
     else

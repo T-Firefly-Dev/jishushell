@@ -166,7 +166,8 @@ JISHU_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd 2>/dev/null |
 NODE_VERSION="${JISHU_NODE_VERSION:-22}"
 NVM_VERSION="${JISHU_NVM_VERSION:-0.40.4}"
 NOMAD_VERSION="${JISHU_NOMAD_VERSION:-1.6.5}"
-JISHUSHELL_PORT="${JISHUSHELL_PORT:-8090}"
+JISHUSHELL_PORT="${JISHUSHELL_PORT:-8091}"
+JISHUSHELL_PANEL_PORT="${JISHUSHELL_PANEL_PORT:-8090}"
 
 # ──── NPM Registry Configuration ────
 # Pass --registry <url> to override the npm registry for all installs.
@@ -206,6 +207,37 @@ JISHUSHELL_BIN_DIR="${JISHUSHELL_BIN_DIR:-$JISHUSHELL_HOME/bin}"
 # Pick tagline
 TAGLINE=""
 pick_tagline
+JISHUSHELL_PANEL_SERVICE_STARTED=0
+JISHUSHELL_INSTALLED_PACKAGE_DIR="${JISHUSHELL_INSTALLED_PACKAGE_DIR:-}"
+
+jishushell_panel_bundled() {
+    local _pkg_root
+    if [[ -n "${JISHUSHELL_INSTALLED_PACKAGE_DIR:-}" ]]; then
+        [[ -f "${JISHUSHELL_INSTALLED_PACKAGE_DIR}/node_modules/jishushell-panel/package.json" ]] && return 0
+        [[ -f "${JISHUSHELL_INSTALLED_PACKAGE_DIR}/node_modules/jishushell-panel/output/dist/server.js" ]] && return 0
+    fi
+    _pkg_root="$(cd "${JISHU_SCRIPT_DIR}/.." 2>/dev/null && pwd || true)"
+    [[ -n "$_pkg_root" ]] || return 1
+    [[ -f "${_pkg_root}/node_modules/jishushell-panel/package.json" ]] && return 0
+    [[ -f "${_pkg_root}/node_modules/jishushell-panel/output/dist/server.js" ]] && return 0
+    return 1
+}
+
+jishushell_panel_server_path() {
+    local _pkg_root
+    if [[ -n "${JISHUSHELL_INSTALLED_PACKAGE_DIR:-}" ]]; then
+        local _installed_server="${JISHUSHELL_INSTALLED_PACKAGE_DIR}/node_modules/jishushell-panel/output/dist/server.js"
+        if [[ -f "$_installed_server" ]]; then
+            printf '%s\n' "$_installed_server"
+            return 0
+        fi
+    fi
+    _pkg_root="$(cd "${JISHU_SCRIPT_DIR}/.." 2>/dev/null && pwd || true)"
+    [[ -n "$_pkg_root" ]] || return 1
+    local _server="${_pkg_root}/node_modules/jishushell-panel/output/dist/server.js"
+    [[ -f "$_server" ]] || return 1
+    printf '%s\n' "$_server"
+}
 
 # Colors
 BOLD='\033[1m'
@@ -253,17 +285,6 @@ _JISHU_TEE_PID=""
 _JISHU_LOG_FIFO=""
 _JISHU_DETAIL_LOG=""
 
-# Legacy environment variable mapping
-map_legacy_env() {
-    local key="$1"
-    local legacy="$2"
-    if [[ -z "${!key:-}" && -n "${!legacy:-}" ]]; then
-        printf -v "$key" '%s' "${!legacy}"
-    fi
-}
-
-# (legacy env var mappings reserved for future renames)
-
 # ─── UI helpers ───────────────────────────────────────────────────────────────
 ui_info() {
     echo -e "${MUTED}·${NC} $*"
@@ -295,6 +316,12 @@ ui_section() {
 ui_kv() {
     local key="$1" value="$2"
     printf "${MUTED}%-18s${NC} %s\n" "$key:" "$value"
+}
+
+ui_clear_tty_line() {
+    if ( : > /dev/tty ) 2>/dev/null; then
+        printf '\r\033[K' >/dev/tty
+    fi
 }
 
 # ─── Detail-log helpers ───────────────────────────────────────────────────────
@@ -455,12 +482,16 @@ check_sudo() {
     fi
 
     if ! sudo -n true 2>/dev/null; then
+        ui_clear_tty_line
         ui_info "Some steps require sudo — you may be prompted for your password."
+        if ( : > /dev/tty ) 2>/dev/null; then
+            printf '\r\033[K%s\n' "· Waiting for sudo password; npm progress is paused for this prompt." >/dev/tty
+        fi
         if ! is_promptable; then
             ui_error "Failed to obtain sudo privileges (no interactive TTY available)"
             exit 1
         fi
-        if ! sudo -p "Password: " -v </dev/tty; then
+        if ! sudo -p "Password: " -v </dev/tty >/dev/tty 2>&1; then
             ui_error "Failed to obtain sudo privileges"
             exit 1
         fi
@@ -2044,6 +2075,20 @@ _port_is_listening() {
     fi
 }
 
+_wait_for_port() {
+    local port="$1"
+    local timeout="${2:-15}"
+    local waited=0
+    while (( waited < timeout )); do
+        if _port_is_listening "$port"; then
+            return 0
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    return 1
+}
+
 # Write nomad.hcl if it does not already exist.
 # Safe to call multiple times — never overwrites an existing config.
 _ensure_nomad_hcl() {
@@ -2284,6 +2329,8 @@ WantedBy=multi-user.target"
         ${SUDO} mv /tmp/nomad.service.$$ "$svc_path"
         need_reload=1
     fi
+    ${SUDO} chown root:root "$svc_path" 2>/dev/null || true
+    ${SUDO} chmod 644 "$svc_path" 2>/dev/null || true
 
     # Keep the real user owning ~/.jishushell except for Nomad's own state,
     # which must be root-owned because the agent runs as root for driver fingerprinting.
@@ -2549,7 +2596,7 @@ PLIST
 
 _save_openclaw_image_to_panel() {
     local image="$1"
-    local panel_file="${JISHUSHELL_HOME}/panel.json"
+    local panel_file="${JISHUSHELL_HOME}/core.json"
     node -e "
 const fs = require('fs');
 const p = '${panel_file}';
@@ -2562,7 +2609,7 @@ fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 }
 
 _read_openclaw_image_from_panel() {
-    local panel_file="${JISHUSHELL_HOME}/panel.json"
+    local panel_file="${JISHUSHELL_HOME}/core.json"
     node -e "
 const fs = require('fs');
 const p = '${panel_file}';
@@ -2689,7 +2736,7 @@ install_openclaw() {
 
     # ── Step 2: Reuse the currently configured pinned image if it already
     # exists locally. This avoids re-pulling :latest on machines where the
-    # running JishuShell service has already migrated panel.json from a mutable
+    # running JishuShell service has already migrated core.json from a mutable
     # tag (e.g. :latest) to an immutable version tag (e.g. :2026.4.9).
     configured_tag="$(_read_openclaw_image_from_panel)"
     if [[ -n "${configured_tag}" ]] && docker_exec image inspect "${configured_tag}" &>/dev/null 2>&1; then
@@ -2806,6 +2853,27 @@ jishushell_package_spec() {
     printf 'jishushell'
 }
 
+find_local_jishushell_tgz() {
+    [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]] || return 1
+
+    local _candidate
+    for _candidate in "${JISHU_SCRIPT_DIR}"/jishushell-gui-*.tgz "${JISHU_SCRIPT_DIR}"/jishushell-cli-*.tgz "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
+        [[ -f "$_candidate" ]] || continue
+        printf '%s\n' "$_candidate"
+        return 0
+    done
+    return 1
+}
+
+jishushell_package_name_from_spec() {
+    local _spec="${1:-}"
+    case "$_spec" in
+        jishushell-gui|jishushell-gui@*|*/jishushell-gui-*.tgz) printf 'jishushell-gui' ;;
+        jishushell|jishushell@*|*/jishushell-*.tgz) printf 'jishushell' ;;
+        *) printf 'jishushell' ;;
+    esac
+}
+
 # show_install_plan [--with-jishushell]
 show_install_plan() {
     local with_jishushell=0
@@ -2831,11 +2899,8 @@ show_install_plan() {
             _plan_jishu="skip"
         else
             local _plan_tgz=""
-            if [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]]; then
-                for _c in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
-                    [[ -f "$_c" ]] && { _plan_tgz="$(basename "$_c")"; break; }
-                done
-            fi
+            _plan_tgz="$(find_local_jishushell_tgz 2>/dev/null || true)"
+            [[ -n "$_plan_tgz" ]] && _plan_tgz="$(basename "$_plan_tgz")"
             _plan_jishu="${_plan_tgz:+npm install -g ${_plan_tgz} (local)}${_plan_tgz:-npm install -g $(jishushell_package_spec)}"
         fi
         ui_kv "JishuShell"         "$_plan_jishu"
@@ -2916,7 +2981,7 @@ show_summary() {
     fi
 
     if [[ $with_jishushell -eq 1 && $SKIP_JISHUSHELL -eq 0 ]]; then
-        local _wrapper="${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
+        local _wrapper="${JISHUSHELL_BIN_DIR}/jishushell-core-start"
         if [[ -x "$_wrapper" ]]; then
             ui_kv "JishuShell" "✓ ${_wrapper}"
         elif command -v jishushell &>/dev/null; then
@@ -2948,6 +3013,10 @@ show_summary() {
         echo ""
         ui_kv "Log file" "${JISHU_LOG_FILE}"
     fi
+    if [[ $with_jishushell -eq 1 && $SKIP_JISHUSHELL -eq 0 ]] && jishushell_panel_bundled; then
+        echo ""
+        echo -e "${WARN}${BOLD}If JishuShell is already open in a browser, refresh the page to load the updated web UI.${NC}"
+    fi
     echo ""
     if [[ $all_ok -eq 1 && $with_jishushell -eq 1 && $SKIP_JISHUSHELL -eq 0 ]]; then
         # Detect the primary non-loopback LAN IP address.
@@ -2973,15 +3042,47 @@ show_summary() {
             fi
         fi
 
-        echo -e "${SUCCESS}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
-        echo -e "${SUCCESS}${BOLD}  ║  Installation complete!                              ║${NC}"
-        echo -e "${SUCCESS}${BOLD}  ║                                                      ║${NC}"
-        echo -e "${SUCCESS}${BOLD}  ║  Open your browser and navigate to:                  ║${NC}"
-        echo -e "${SUCCESS}${BOLD}  ║    http://localhost:${JISHUSHELL_PORT}/$(printf '%*s' $((32 - ${#JISHUSHELL_PORT})) '')║${NC}"
+        local _box_width=54
+        local _box_lines=(
+            "  Installation complete!"
+            ""
+            "  Core server is available at:"
+            "    http://localhost:${JISHUSHELL_PORT}/"
+        )
         if [[ -n "$_local_ip" ]]; then
-        echo -e "${SUCCESS}${BOLD}  ║    http://${_local_ip}:${JISHUSHELL_PORT}/$(printf '%*s' $((28 - ${#_local_ip} - ${#JISHUSHELL_PORT})) '')║${NC}"
+            _box_lines+=("    http://${_local_ip}:${JISHUSHELL_PORT}/")
         fi
-        echo -e "${SUCCESS}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
+        if jishushell_panel_bundled; then
+            local _panel_label="  Panel web UI service:"
+            if [[ "$JISHUSHELL_PANEL_SERVICE_STARTED" != "1" ]]; then
+                _panel_label="  Panel web UI (run jishushell-gui):"
+            fi
+            _box_lines+=(
+                ""
+                "$_panel_label"
+                "    http://localhost:${JISHUSHELL_PANEL_PORT}/"
+            )
+            if [[ -n "$_local_ip" ]]; then
+                _box_lines+=("    http://${_local_ip}:${JISHUSHELL_PANEL_PORT}/")
+            fi
+        fi
+
+        local _box_line
+        for _box_line in "${_box_lines[@]}"; do
+            if (( ${#_box_line} > _box_width )); then
+                _box_width=${#_box_line}
+            fi
+        done
+
+        local _box_border
+        printf -v _box_border '%*s' "$_box_width" ''
+        _box_border="${_box_border// /═}"
+
+        printf '%b  ╔%s╗%b\n' "${SUCCESS}${BOLD}" "$_box_border" "${NC}"
+        for _box_line in "${_box_lines[@]}"; do
+            printf "%b  ║%-${_box_width}s║%b\n" "${SUCCESS}${BOLD}" "$_box_line" "${NC}"
+        done
+        printf '%b  ╚%s╝%b\n' "${SUCCESS}${BOLD}" "$_box_border" "${NC}"
         echo ""
     fi
 }
@@ -2990,7 +3091,7 @@ show_summary() {
 # Core install orchestration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── 6. JishuShell backend (npm install -g jishushell) ───────────────────────
+# ─── 6. JishuShell core package (CLI-only or Core+Panel GUI) ──────────────────
 
 install_jishushell() {
     ui_stage "JishuShell"
@@ -3006,17 +3107,16 @@ install_jishushell() {
         local _dry_reg=""
         [[ -n "${NPM_REGISTRY:-}" ]] && _dry_reg=" --registry ${NPM_REGISTRY}"
         local _dry_tgz=""
-        if [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]]; then
-            for _c in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
-                [[ -f "$_c" ]] && { _dry_tgz="$_c"; break; }
-            done
-        fi
+        _dry_tgz="$(find_local_jishushell_tgz 2>/dev/null || true)"
         if [[ -n "$_dry_tgz" ]]; then
             ui_info "[dry-run] Would: npm install -g ${_dry_tgz}  (local package)"
         else
             ui_info "[dry-run] Would: npm install -g ${jishushell_pkg_spec}${_dry_reg}"
         fi
-        ui_info "[dry-run] Would write wrapper: ${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
+        ui_info "[dry-run] Would write wrapper: ${JISHUSHELL_BIN_DIR}/jishushell-core-start"
+        if jishushell_panel_bundled || [[ "$(basename "${_dry_tgz:-}")" == jishushell-gui-*.tgz ]]; then
+            ui_info "[dry-run] Would write wrapper: ${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
+        fi
         return 0
     fi
 
@@ -3061,22 +3161,17 @@ install_jishushell() {
 
     # When jishushell is already installed (e.g. running as npm postinstall hook),
     # skip the npm install step and only write the wrapper + service.
+    local tgz_path=""
+    local expected_pkg_name
     if [[ "${JISHUSHELL_SKIP_NPM_INSTALL:-0}" != "1" ]]; then
         # Prefer a local .tgz package in the same directory as this script.
-        local tgz_path=""
-        local _tgz_candidate
-        if [[ "${JISHUSHELL_VERSION_OVERRIDE}" != "1" && "${JISHUSHELL_NPM_VERSION}" == "latest" ]]; then
-            for _tgz_candidate in "${JISHU_SCRIPT_DIR}"/jishushell-*.tgz; do
-                if [[ -f "$_tgz_candidate" ]]; then
-                    tgz_path="$_tgz_candidate"
-                    break
-                fi
-            done
-        fi
+        tgz_path="$(find_local_jishushell_tgz 2>/dev/null || true)"
+        expected_pkg_name="$(jishushell_package_name_from_spec "${tgz_path:-$jishushell_pkg_spec}")"
 
         # Export a sentinel so post-install.sh (triggered by npm's postinstall
-        # lifecycle hook) knows it was launched from inside jishu-install.sh and
-        # must not re-run Docker/Nomad/OpenClaw installation steps again.
+        # lifecycle hook) knows it was launched from inside jishu-install.sh.
+        # The parent installer resumes after npm returns and owns wrapper/service
+        # setup, which keeps core and panel startup ordering in one place.
         export JISHU_RUNNING_IN_INSTALLER=1
 
         if [[ -n "$tgz_path" ]]; then
@@ -3104,6 +3199,10 @@ install_jishushell() {
         unset JISHU_RUNNING_IN_INSTALLER
     else
         ui_info "Skipping npm install (already installed by caller)"
+        local current_pkg_root current_pkg_name
+        current_pkg_root="$(cd "${JISHU_SCRIPT_DIR}/.." 2>/dev/null && pwd || true)"
+        current_pkg_name="$("$node_bin" -p "require('${current_pkg_root}/package.json').name" 2>/dev/null || true)"
+        expected_pkg_name="$(jishushell_package_name_from_spec "${current_pkg_name:-$jishushell_pkg_spec}")"
     fi
 
     # Resolve the installed cli.js path via the npm that did the install
@@ -3113,9 +3212,27 @@ install_jishushell() {
         ui_error "Cannot locate npm root — wrapper cannot be written"
         return 1
     fi
-    local jishushell_bin="${npm_root}/jishushell/dist/cli.js"
-    ui_success "JishuShell installed ($(${node_bin} -p "require('${npm_root}/jishushell/package.json').version" 2>/dev/null || echo 'version unknown'))"
-    local wrapper="${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
+    local jishushell_pkg_dir="${npm_root}/${expected_pkg_name:-jishushell}"
+    if [[ ! -f "${jishushell_pkg_dir}/dist/cli.js" ]]; then
+        if [[ -f "${npm_root}/jishushell/dist/cli.js" ]]; then
+            jishushell_pkg_dir="${npm_root}/jishushell"
+        elif [[ -f "${npm_root}/jishushell-cli/dist/cli.js" ]]; then
+            # Legacy package name from the brief 'jishushell-cli' split-era
+            jishushell_pkg_dir="${npm_root}/jishushell-cli"
+        elif [[ -f "${npm_root}/jishushell-gui/dist/cli.js" ]]; then
+            # Legacy GUI package name from before the 'jishushell' rename
+            jishushell_pkg_dir="${npm_root}/jishushell-gui"
+        fi
+    fi
+    local jishushell_bin="${jishushell_pkg_dir}/dist/cli.js"
+    if [[ ! -f "$jishushell_bin" ]]; then
+        ui_error "Cannot locate installed JishuShell CLI entrypoint in ${npm_root}"
+        return 1
+    fi
+    JISHUSHELL_INSTALLED_PACKAGE_DIR="$jishushell_pkg_dir"
+    ui_success "JishuShell CLI installed ($(${node_bin} -p "require('${jishushell_pkg_dir}/package.json').version" 2>/dev/null || echo 'version unknown'))"
+    local wrapper="${JISHUSHELL_BIN_DIR}/jishushell-core-start"
+    local cli_wrapper="${JISHUSHELL_BIN_DIR}/jishushell"
     mkdir -p "${JISHUSHELL_BIN_DIR}"
 
     # The wrapper resolves node at runtime — it does NOT hardcode the path so
@@ -3123,6 +3240,162 @@ install_jishushell() {
     cat > "$wrapper" << WRAPPER
 #!/usr/bin/env bash
 set -euo pipefail
+
+_WRAPPER_PATH="\${BASH_SOURCE[0]:-\$0}"
+_WRAPPER_DIR="\$(cd "\$(dirname "\$_WRAPPER_PATH")" && pwd)"
+_DEFAULT_JISHUSHELL_HOME="\$(cd "\${_WRAPPER_DIR}/.." && pwd)"
+JISHUSHELL_HOME="\${JISHUSHELL_HOME:-\$_DEFAULT_JISHUSHELL_HOME}"
+
+_resolve_home() {
+    if [ -n "\${SUDO_UID:-}" ] && command -v getent >/dev/null 2>&1; then
+        local _entry
+        _entry="\$(getent passwd "\$SUDO_UID" 2>/dev/null || true)"
+        if [ -n "\$_entry" ]; then
+            printf '%s\n' "\$_entry" | cut -d: -f6
+            return
+        fi
+    fi
+    case "\$JISHUSHELL_HOME" in
+        */.jishushell) printf '%s\n' "\${JISHUSHELL_HOME%/.jishushell}" ;;
+        *) printf '%s\n' "\${HOME:-\$PWD}" ;;
+    esac
+}
+HOME="\$(_resolve_home)"
+export HOME JISHUSHELL_HOME
+
+_find_node() {
+    command -v node 2>/dev/null && return
+    local nvm_dir="\${NVM_DIR:-\${HOME}/.nvm}"
+    [ -s "\$nvm_dir/nvm.sh" ] && . "\$nvm_dir/nvm.sh" --no-use 2>/dev/null || true
+    command -v node 2>/dev/null && return
+    local ndir="\${HOME}/.nvm/versions/node"
+    [ -d "\$ndir" ] && find "\$ndir" -name node -type f 2>/dev/null | sort -V | tail -1 || true
+}
+NODE_BIN="\$(_find_node || true)"
+if [ -z "\$NODE_BIN" ]; then
+    NODE_BIN="/opt/homebrew/bin/node"
+fi
+if [ ! -x "\$NODE_BIN" ]; then
+    echo "[jishushell-core-start] ERROR: cannot locate node binary" >&2
+    exit 1
+fi
+
+NOMAD_ENV="\${JISHUSHELL_HOME}/nomad.env"
+
+[ -f "\$NOMAD_ENV" ] && source "\$NOMAD_ENV"
+
+if [ ! -f "${jishushell_bin}" ]; then
+    echo "[jishushell-core-start] ERROR: could not find jishushell at ${jishushell_bin}" >&2
+    exit 1
+fi
+
+export JISHUSHELL_CORE_BIN="${jishushell_bin}"
+export JISHUSHELL_CORE_PORT=${JISHUSHELL_PORT}
+export NODE_ENV="\${NODE_ENV:-production}"
+if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:${JISHUSHELL_PORT}[[:space:]]'; then
+    echo "JishuShell core port ${JISHUSHELL_PORT} is already listening; not starting another core."
+    exit 0
+fi
+exec "\$NODE_BIN" "${jishushell_bin}" serve --core-only --port ${JISHUSHELL_PORT}
+WRAPPER
+    chmod +x "$wrapper"
+    rm -f "$cli_wrapper"
+    cat > "$cli_wrapper" << CLIWRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+
+_WRAPPER_PATH="\${BASH_SOURCE[0]:-\$0}"
+_WRAPPER_DIR="\$(cd "\$(dirname "\$_WRAPPER_PATH")" && pwd)"
+_DEFAULT_JISHUSHELL_HOME="\$(cd "\${_WRAPPER_DIR}/.." && pwd)"
+JISHUSHELL_HOME="\${JISHUSHELL_HOME:-\$_DEFAULT_JISHUSHELL_HOME}"
+
+_resolve_home() {
+    if [ -n "\${SUDO_UID:-}" ] && command -v getent >/dev/null 2>&1; then
+        local _entry
+        _entry="\$(getent passwd "\$SUDO_UID" 2>/dev/null || true)"
+        if [ -n "\$_entry" ]; then
+            printf '%s\n' "\$_entry" | cut -d: -f6
+            return
+        fi
+    fi
+    case "\$JISHUSHELL_HOME" in
+        */.jishushell) printf '%s\n' "\${JISHUSHELL_HOME%/.jishushell}" ;;
+        *) printf '%s\n' "\${HOME:-\$PWD}" ;;
+    esac
+}
+HOME="\$(_resolve_home)"
+export HOME JISHUSHELL_HOME
+
+_find_node() {
+    command -v node 2>/dev/null && return
+    local nvm_dir="\${NVM_DIR:-\${HOME}/.nvm}"
+    [ -s "\$nvm_dir/nvm.sh" ] && . "\$nvm_dir/nvm.sh" --no-use 2>/dev/null || true
+    command -v node 2>/dev/null && return
+    local ndir="\${HOME}/.nvm/versions/node"
+    [ -d "\$ndir" ] && find "\$ndir" -name node -type f 2>/dev/null | sort -V | tail -1 || true
+}
+NODE_BIN="\$(_find_node || true)"
+if [ -z "\$NODE_BIN" ]; then
+    NODE_BIN="/opt/homebrew/bin/node"
+fi
+if [ ! -x "\$NODE_BIN" ]; then
+    echo "[jishushell] ERROR: cannot locate node binary" >&2
+    exit 1
+fi
+
+NOMAD_ENV="\${JISHUSHELL_HOME}/nomad.env"
+
+[ -f "\$NOMAD_ENV" ] && source "\$NOMAD_ENV"
+
+if [ ! -f "${jishushell_bin}" ]; then
+    echo "[jishushell] ERROR: could not find jishushell at ${jishushell_bin}" >&2
+    exit 1
+fi
+
+export JISHUSHELL_CORE_BIN="${jishushell_bin}"
+export JISHUSHELL_CORE_PORT=${JISHUSHELL_PORT}
+export NODE_ENV="\${NODE_ENV:-production}"
+exec "\$NODE_BIN" "${jishushell_bin}" "\$@"
+CLIWRAPPER
+    chmod +x "$cli_wrapper"
+ui_success "JishuShell installed — wrapper: ${wrapper}"
+
+if jishushell_panel_bundled; then
+        local panel_server
+        if ! panel_server="$(jishushell_panel_server_path)"; then
+            ui_warn "Panel package detected, but server entrypoint was not found"
+            return 0
+        fi
+        local panel_manage_core_default="${JISHUSHELL_PANEL_MANAGE_CORE_DEFAULT:-0}"
+        if [[ "$panel_manage_core_default" != "1" ]]; then
+            panel_manage_core_default="0"
+        fi
+        local panel_wrapper="${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
+        cat > "$panel_wrapper" << PANELWRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+
+_WRAPPER_PATH="\${BASH_SOURCE[0]:-\$0}"
+_WRAPPER_DIR="\$(cd "\$(dirname "\$_WRAPPER_PATH")" && pwd)"
+_DEFAULT_JISHUSHELL_HOME="\$(cd "\${_WRAPPER_DIR}/.." && pwd)"
+JISHUSHELL_HOME="\${JISHUSHELL_HOME:-\$_DEFAULT_JISHUSHELL_HOME}"
+
+_resolve_home() {
+    if [ -n "\${SUDO_UID:-}" ] && command -v getent >/dev/null 2>&1; then
+        local _entry
+        _entry="\$(getent passwd "\$SUDO_UID" 2>/dev/null || true)"
+        if [ -n "\$_entry" ]; then
+            printf '%s\n' "\$_entry" | cut -d: -f6
+            return
+        fi
+    fi
+    case "\$JISHUSHELL_HOME" in
+        */.jishushell) printf '%s\n' "\${JISHUSHELL_HOME%/.jishushell}" ;;
+        *) printf '%s\n' "\${HOME:-\$PWD}" ;;
+    esac
+}
+HOME="\$(_resolve_home)"
+export HOME JISHUSHELL_HOME
 
 _find_node() {
     command -v node 2>/dev/null && return
@@ -3141,63 +3414,36 @@ if [ ! -x "\$NODE_BIN" ]; then
     exit 1
 fi
 
-# Data directory: honour explicit env override, otherwise use the real
-# user home embedded at install time (avoids /root when run as root).
-JISHUSHELL_HOME="\${JISHUSHELL_HOME:-${REAL_HOME}/.jishushell}"
-NOMAD_ENV="\${JISHUSHELL_HOME}/nomad.env"
+export NODE_ENV="\${NODE_ENV:-production}"
+export JISHUSHELL_CORE_BASE_URL="\${JISHUSHELL_CORE_BASE_URL:-http://127.0.0.1:${JISHUSHELL_PORT}}"
+export JISHUSHELL_PANEL_PORT="\${JISHUSHELL_PANEL_PORT:-${JISHUSHELL_PANEL_PORT}}"
+export JISHUSHELL_PANEL_MANAGE_CORE="\${JISHUSHELL_PANEL_MANAGE_CORE:-${panel_manage_core_default}}"
 
-[ -f "\$NOMAD_ENV" ] && source "\$NOMAD_ENV"
-
-if [ ! -f "${jishushell_bin}" ]; then
-    echo "[jishushell-panel-start] ERROR: could not find jishushell at ${jishushell_bin}" >&2
+if [ ! -f "${panel_server}" ]; then
+    echo "[jishushell-panel-start] ERROR: could not find jishushell-panel at ${panel_server}" >&2
     exit 1
 fi
 
-exec "\$NODE_BIN" "${jishushell_bin}" "\$@"
-WRAPPER
-    chmod +x "$wrapper"
-    ui_success "JishuShell installed — wrapper: ${wrapper}"
+exec "\$NODE_BIN" "${panel_server}" "\$@"
+PANELWRAPPER
+        chmod +x "$panel_wrapper"
+        ui_success "JishuShell Panel installed — wrapper: ${panel_wrapper}"
+    fi
 }
 
-install_jishushell_service() {
-    ui_stage "JishuShell service"
+install_jishushell_panel_service() {
+    jishushell_panel_bundled || return 0
 
-    if [[ $SKIP_JISHUSHELL_SERVICE -eq 1 ]]; then
-        ui_info "Skipped (--skip-jishushell-service)"
-        return 0
-    fi
-
-    local wrapper="${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
-    local log_path="${JISHUSHELL_HOME}/jishushell.log"
-
-    if [[ "$DRY_RUN" == "1" ]]; then
-        ui_info "[dry-run] Would register jishushell as a system service"
+    local panel_wrapper="${JISHUSHELL_BIN_DIR}/jishushell-panel-start"
+    local log_path="${JISHUSHELL_HOME}/jishushell-panel.log"
+    if [[ ! -x "$panel_wrapper" ]]; then
+        ui_warn "JishuShell Panel wrapper not found — run jishushell-gui manually or reinstall the Panel package"
         return 0
     fi
 
     if [[ "$OS" == "macos" ]]; then
         local plist_label="com.jishushell.panel"
         local plist_path="${HOME}/Library/LaunchAgents/${plist_label}.plist"
-
-        local panel_gate="${JISHUSHELL_BIN_DIR}/panel-launchd-wrapper.sh"
-        mkdir -p "${JISHUSHELL_BIN_DIR}"
-        cat > "$panel_gate" << PANELGATE
-#!/bin/bash
-set -u
-# Auto-generated by jishu-install.sh — do not edit by hand.
-# Lightweight 60s docker-readiness gate so the first post-reboot page
-# load doesn't flash "image missing". Panel self-heals afterward, so on
-# timeout we start anyway (the UI must be observable).
-PANEL_DOCKER_WAIT_DEADLINE=60
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-deadline=\$(( \$(date +%s) + \$PANEL_DOCKER_WAIT_DEADLINE ))
-while ! DOCKER_HOST="unix://${_COLIMA_SOCKET}" /usr/bin/env docker info >/dev/null 2>&1; do
-  [ \$(date +%s) -ge \$deadline ] && { echo "[panel-gate] docker not ready after 60s; starting anyway" >&2; break; }
-  sleep 2
-done
-exec "${wrapper}" serve
-PANELGATE
-        chmod 755 "$panel_gate"
 
         mkdir -p "${HOME}/Library/LaunchAgents"
         cat > "$plist_path" << PLIST
@@ -3209,7 +3455,175 @@ PANELGATE
     <string>${plist_label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${panel_gate}</string>
+        <string>${panel_wrapper}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${REAL_HOME}</string>
+        <key>JISHUSHELL_HOME</key>
+        <string>${JISHUSHELL_HOME}</string>
+        <key>JISHUSHELL_CORE_BASE_URL</key>
+        <string>http://127.0.0.1:${JISHUSHELL_PORT}</string>
+        <key>JISHUSHELL_PANEL_PORT</key>
+        <string>${JISHUSHELL_PANEL_PORT}</string>
+        <key>JISHUSHELL_PANEL_MANAGE_CORE</key>
+        <string>0</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>${log_path}</string>
+</dict>
+</plist>
+PLIST
+
+        if ! _wait_for_port "$JISHUSHELL_PORT" 30; then
+            ui_warn "Core server is not ready on port ${JISHUSHELL_PORT}; Panel launchd agent was written but not started"
+            return 0
+        fi
+
+        launchctl unload "$plist_path" 2>/dev/null || true
+        if launchctl load -w "$plist_path" 2>/dev/null; then
+            if _wait_for_port "$JISHUSHELL_PANEL_PORT" 15; then
+                JISHUSHELL_PANEL_SERVICE_STARTED=1
+                ui_success "JishuShell Panel launchd agent installed and started"
+            else
+                ui_warn "JishuShell Panel launchd agent installed, but port ${JISHUSHELL_PANEL_PORT} is not listening yet"
+            fi
+        else
+            ui_warn "Could not load JishuShell Panel launchd agent"
+        fi
+        return 0
+    fi
+
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        return 0
+    fi
+
+    local service_content="[Unit]
+Description=JishuShell Panel
+After=network-online.target jishushell.service
+Wants=network-online.target jishushell.service
+
+[Service]
+Type=simple
+User=${REAL_USER}
+Environment=HOME=${REAL_HOME}
+Environment=JISHUSHELL_HOME=${JISHUSHELL_HOME}
+Environment=JISHUSHELL_CORE_BASE_URL=http://127.0.0.1:${JISHUSHELL_PORT}
+Environment=JISHUSHELL_PANEL_PORT=${JISHUSHELL_PANEL_PORT}
+Environment=JISHUSHELL_PANEL_MANAGE_CORE=0
+Environment=NODE_ENV=production
+ExecStart=${panel_wrapper}
+Restart=on-failure
+RestartSec=3
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=${JISHUSHELL_HOME}
+
+[Install]
+WantedBy=multi-user.target"
+
+    local svc_path="/etc/systemd/system/jishushell-panel.service"
+    local need_reload=0
+    if [[ ! -f "$svc_path" ]] || ! echo "$service_content" | diff -q - "$svc_path" &>/dev/null; then
+        echo "$service_content" > /tmp/jishushell-panel.service.$$
+        ${SUDO} mv /tmp/jishushell-panel.service.$$ "$svc_path"
+        need_reload=1
+    fi
+    ${SUDO} chown root:root "$svc_path" 2>/dev/null || true
+    ${SUDO} chmod 644 "$svc_path" 2>/dev/null || true
+
+    if [[ $need_reload -eq 1 ]]; then
+        ${SUDO} systemctl daemon-reload
+    fi
+
+    if ! ${SUDO} systemctl enable jishushell-panel 2>/dev/null; then
+        ui_warn "Could not enable jishushell-panel systemd service"
+        return 0
+    fi
+
+    if ! _wait_for_port "$JISHUSHELL_PORT" 30; then
+        ui_warn "Core server is not ready on port ${JISHUSHELL_PORT}; Panel systemd service was enabled but not started"
+        return 0
+    fi
+
+    if ${SUDO} systemctl restart jishushell-panel 2>/dev/null; then
+        if _wait_for_port "$JISHUSHELL_PANEL_PORT" 15; then
+            JISHUSHELL_PANEL_SERVICE_STARTED=1
+            ui_success "JishuShell Panel systemd service installed and started"
+        else
+            ui_warn "JishuShell Panel systemd service installed, but port ${JISHUSHELL_PANEL_PORT} is not listening yet"
+        fi
+    else
+        ui_warn "Could not start jishushell-panel systemd service"
+    fi
+}
+
+install_jishushell_service() {
+    if jishushell_panel_bundled; then
+        ui_stage "JishuShell services"
+    else
+        ui_stage "JishuShell service"
+    fi
+
+    if [[ $SKIP_JISHUSHELL_SERVICE -eq 1 ]]; then
+        ui_info "Skipped (--skip-jishushell-service)"
+        return 0
+    fi
+
+    local wrapper="${JISHUSHELL_BIN_DIR}/jishushell-core-start"
+    local log_path="${JISHUSHELL_HOME}/jishushell-core.log"
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+        ui_info "[dry-run] Would register jishushell as a system service"
+        if jishushell_panel_bundled; then
+            ui_info "[dry-run] Would register jishushell-panel as a system service"
+        fi
+        return 0
+    fi
+
+    if [[ "$OS" == "macos" ]]; then
+        local plist_label="com.jishushell.core"
+        local plist_path="${HOME}/Library/LaunchAgents/${plist_label}.plist"
+
+        local core_gate="${JISHUSHELL_BIN_DIR}/core-launchd-wrapper.sh"
+        mkdir -p "${JISHUSHELL_BIN_DIR}"
+        cat > "$core_gate" << COREGATE
+#!/bin/bash
+set -u
+# Auto-generated by jishu-install.sh — do not edit by hand.
+# Lightweight 60s docker-readiness gate before starting core. Core self-heals
+# afterward, so on timeout we start anyway.
+CORE_DOCKER_WAIT_DEADLINE=60
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+deadline=\$(( \$(date +%s) + \$CORE_DOCKER_WAIT_DEADLINE ))
+while ! DOCKER_HOST="unix://${_COLIMA_SOCKET}" /usr/bin/env docker info >/dev/null 2>&1; do
+  [ \$(date +%s) -ge \$deadline ] && { echo "[core-gate] docker not ready after 60s; starting anyway" >&2; break; }
+  sleep 2
+done
+exec "${wrapper}"
+COREGATE
+        chmod 755 "$core_gate"
+
+        mkdir -p "${HOME}/Library/LaunchAgents"
+        cat > "$plist_path" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${plist_label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${core_gate}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -3225,10 +3639,15 @@ PLIST
 
         launchctl unload "$plist_path" 2>/dev/null || true
         if launchctl load -w "$plist_path" 2>/dev/null; then
-            ui_success "JishuShell backend service installed and started"
+            if _wait_for_port "$JISHUSHELL_PORT" 30; then
+                ui_success "JishuShell core launchd agent installed and started"
+            else
+                ui_warn "JishuShell core launchd agent installed, but port ${JISHUSHELL_PORT} is not listening yet"
+            fi
         else
             ui_warn "Could not load jishushell launchd agent"
         fi
+        install_jishushell_panel_service || true
         _enable_autologin
         return 0
     fi
@@ -3238,7 +3657,7 @@ PLIST
     fi
 
     local service_content="[Unit]
-Description=JishuShell Backend
+Description=JishuShell Core
 After=network-online.target nomad.service
 Wants=network-online.target
 
@@ -3247,7 +3666,7 @@ Type=simple
 User=${REAL_USER}
 SupplementaryGroups=docker
 EnvironmentFile=-/etc/jishushell/nomad.env
-ExecStart=${wrapper} serve
+ExecStart=${wrapper}
 Restart=on-failure
 RestartSec=3
 Environment=HOME=${REAL_HOME}
@@ -3256,7 +3675,7 @@ ProtectSystem=strict
 PrivateTmp=true
 # /usr/local is whitelisted so app lifecycle scripts (e.g. ollama install.sh,
 # which writes /usr/local/bin/ollama and /usr/local/lib/ollama/) can succeed
-# even when the panel runs under ProtectSystem=strict. The rest of /usr stays
+# even when the core runs under ProtectSystem=strict. The rest of /usr stays
 # read-only.
 ReadWritePaths=${JISHUSHELL_HOME} /etc/jishushell /usr/local
 
@@ -3271,29 +3690,44 @@ WantedBy=multi-user.target"
         ${SUDO} mv /tmp/jishushell.service.$$ "$svc_path"
         need_reload=1
     fi
+    ${SUDO} chown root:root "$svc_path" 2>/dev/null || true
+    ${SUDO} chmod 644 "$svc_path" 2>/dev/null || true
 
     if [[ $need_reload -eq 1 ]]; then
         ${SUDO} systemctl daemon-reload
     fi
 
-    # Enable the service (auto-start on boot).
-    # Use 'enable --now' to also start it immediately — jishushell is the final
-    # component so there is no double-wait concern unlike Nomad.
+    # Enable and start the core service first. The panel service, when bundled,
+    # is handled after the core port is reachable.
     if ! systemctl is-enabled jishushell &>/dev/null 2>&1; then
         if ${SUDO} systemctl enable --now jishushell 2>/dev/null; then
-            ui_success "JishuShell systemd service installed and started"
+            if _wait_for_port "$JISHUSHELL_PORT" 30; then
+                ui_success "JishuShell core systemd service installed and started"
+            else
+                ui_warn "JishuShell core systemd service installed, but port ${JISHUSHELL_PORT} is not listening yet"
+            fi
         else
             ui_warn "Could not enable jishushell systemd service"
         fi
     elif [[ $need_reload -eq 1 ]]; then
         # Service file changed — restart to pick up new config
         ${SUDO} systemctl restart jishushell 2>/dev/null || true
-        ui_success "JishuShell systemd service updated and restarted"
+        if _wait_for_port "$JISHUSHELL_PORT" 30; then
+            ui_success "JishuShell core systemd service updated and restarted"
+        else
+            ui_warn "JishuShell core systemd service updated, but port ${JISHUSHELL_PORT} is not listening yet"
+        fi
     else
         # Package may have been upgraded — always restart to pick up new code
         ${SUDO} systemctl restart jishushell 2>/dev/null || true
-        ui_success "JishuShell systemd service restarted"
+        if _wait_for_port "$JISHUSHELL_PORT" 30; then
+            ui_success "JishuShell core systemd service restarted"
+        else
+            ui_warn "JishuShell core systemd service restarted, but port ${JISHUSHELL_PORT} is not listening yet"
+        fi
     fi
+
+    install_jishushell_panel_service || true
 }
 
 # ─── run_install_components ───────────────────────────────────────────────────
@@ -3416,17 +3850,20 @@ run_install_components() {
         # OpenSSH refuses any key with group/world-readable perms ("bad
         # permissions"), so a 644 key file makes lima hostagent unable to
         # provision the VM (host-addresses + docker context never come up),
-        # docker containers ship empty Ports{}, and the panel proxy 502s.
-        for f in auth.json jwt-secret panel.json nomad.env encryption-key \
+        # docker containers ship empty Ports{}, and the core proxy 502s.
+        for f in auth.json jwt-secret core.json nomad.env encryption-key \
                  colima/_lima/_config/user; do
             local fp="${JISHUSHELL_HOME}/${f}"
             [[ -f "$fp" ]] && ${SUDO} chmod 600 "$fp" 2>/dev/null || true
         done
         # Sync nomad.env from /etc/jishushell if missing in JISHUSHELL_HOME
         if [[ ! -f "${JISHUSHELL_HOME}/nomad.env" && -f /etc/jishushell/nomad.env ]]; then
-            ${SUDO} cp /etc/jishushell/nomad.env "${JISHUSHELL_HOME}/nomad.env"
-            ${SUDO} chown "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "${JISHUSHELL_HOME}/nomad.env"
-            ${SUDO} chmod 600 "${JISHUSHELL_HOME}/nomad.env"
+            if [[ -n "${SUDO}" || -r /etc/jishushell/nomad.env ]]; then
+                if ${SUDO} cp /etc/jishushell/nomad.env "${JISHUSHELL_HOME}/nomad.env"; then
+                    ${SUDO} chown "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "${JISHUSHELL_HOME}/nomad.env"
+                    ${SUDO} chmod 600 "${JISHUSHELL_HOME}/nomad.env"
+                fi
+            fi
         fi
         ui_success "Permissions set: ${REAL_USER}:${REAL_USER} on ${JISHUSHELL_HOME}"
     fi
