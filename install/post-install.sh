@@ -39,8 +39,10 @@ fi
 #
 # Executed automatically via `npm postinstall` after installing the CLI-only or
 # Core+Panel GUI package globally.
-# Installs all runtime dependencies (Docker, Nomad, OpenClaw) and registers the
-# JishuShell service.
+# This hook is intentionally package-scoped: it refreshes user-owned wrappers
+# and tells the operator to run the user-owned wrapper with sudo for system service
+# restart, host repair, and instance migration. Full environment installation
+# belongs to install/jishu-install.sh, not npm postinstall.
 #
 # Skips:
 #   • Node.js                    — already installed (npm is running on it)
@@ -89,8 +91,24 @@ refresh_postinstall_wrappers_quiet() {
     refresh_postinstall_wrappers >/dev/null 2>&1
 }
 
+write_package_update_pending_marker() {
+    local marker="${JISHUSHELL_HOME}/package-update-pending.json"
+    mkdir -p "${JISHUSHELL_HOME}" 2>/dev/null || true
+    cat > "$marker" <<EOF 2>/dev/null || true
+{
+  "schemaVersion": 1,
+  "reason": "npm-postinstall",
+  "createdAt": "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+}
+EOF
+    if [[ -n "${REAL_USER:-}" ]]; then
+        chown "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "$marker" 2>/dev/null || true
+    fi
+    chmod 644 "$marker" 2>/dev/null || true
+}
+
 print_package_only_update_notice() {
-    local reload_cmd="$1"
+    local repair_cmd="$1"
     local wrappers_refreshed="${2:-1}"
     local core_wrapper="${JISHUSHELL_BIN_DIR}/jishushell"
     local legacy_core_wrapper="${JISHUSHELL_BIN_DIR}/jishushell-core-start"
@@ -108,12 +126,12 @@ print_package_only_update_notice() {
     fi
     postinstall_print ""
     postinstall_print_yellow "════════════════════════════════════════════════════════════════════"
-    postinstall_print_yellow "  ⚠  ACTION REQUIRED — System services were NOT reloaded"
-    postinstall_print_yellow "     (sudo is not available from npm postinstall)."
+    postinstall_print_yellow "  ⚠  ACTION REQUIRED — Local repair was NOT run"
+    postinstall_print_yellow "     (npm install only updates package files and wrappers)."
     postinstall_print_yellow ""
     postinstall_print_yellow "  1. Run this command to finish the upgrade:"
     postinstall_print ""
-    postinstall_print_white_bold "       ${reload_cmd}"
+    postinstall_print_white_bold "       ${repair_cmd}"
     postinstall_print ""
     if [[ "$wrappers_refreshed" == "1" && -x "$panel_wrapper" ]]; then
         postinstall_print_yellow "  2. After the command above finishes, refresh any open"
@@ -122,31 +140,6 @@ print_package_only_update_notice() {
     fi
     postinstall_print_yellow "════════════════════════════════════════════════════════════════════"
     postinstall_print ""
-}
-
-schedule_web_update_service_restart() {
-    [[ "${JISHUSHELL_WEB_UPDATE:-0}" == "1" ]] || return 0
-
-    # Old web update workers run inside the pre-upgrade systemd sandbox, where
-    # sudo cannot refresh system services. Terminating the supervised process lets
-    # systemd restart it into the newly installed package without extra privilege.
-    local main_pid="${JISHUSHELL_UPDATE_SERVER_PID:-}"
-    if ! [[ "$main_pid" =~ ^[0-9]+$ && "$main_pid" -gt 1 ]]; then
-        if command -v systemctl >/dev/null 2>&1; then
-            main_pid="$(systemctl show jishushell.service -p MainPID --value 2>/dev/null || true)"
-        fi
-    fi
-    [[ "$main_pid" =~ ^[0-9]+$ && "$main_pid" -gt 1 ]] || return 0
-
-    local delay="${JISHUSHELL_WEB_UPDATE_RESTART_DELAY:-5}"
-    [[ "$delay" =~ ^[0-9]+$ && "$delay" -gt 0 ]] || delay=5
-
-    (
-        sleep "$delay"
-        kill -KILL "$main_pid" 2>/dev/null || true
-    ) >/dev/null 2>&1 &
-    disown 2>/dev/null || true
-    echo "  [post-install] Scheduled web update service restart for PID ${main_pid}"
 }
 
 # When npm's postinstall hook runs inside the outer jishu-install.sh flow, the
@@ -158,11 +151,15 @@ if [[ "${JISHU_RUNNING_IN_INSTALLER:-0}" == "1" ]]; then
     source "${JISHU_SCRIPT_DIR}/jishu-install.sh"
     # Web updates from old single-service installs cannot rewrite systemd units
     # without sudo, but they can refresh the user-owned wrappers that those units
-    # execute. This lets a legacy jishushell.service restart into the bundled
-    # Panel, which then manages core until the later sudo/system reload.
+    # execute. Service restart is intentionally left to the sudo repair command
+    # printed below; use the wrapper path because sudo may not include
+    # ~/.jishushell/bin in PATH yet.
     refresh_postinstall_wrappers
     backup_postinstall_scripts
-    schedule_web_update_service_restart
+    if [[ "${JISHUSHELL_PACKAGE_UPDATE:-0}" == "1" ]]; then
+        write_package_update_pending_marker
+        print_package_only_update_notice "sudo ${JISHUSHELL_BIN_DIR}/jishushell repair" "1"
+    fi
     exit 0
 fi
 
@@ -229,151 +226,141 @@ postinstall_print_white_bold() {
     fi
 }
 
+_postinstall_path_under() {
+    local child="$1"
+    local parent="$2"
+    [[ -n "$child" && -n "$parent" ]] || return 1
+    child="$(cd "$child" 2>/dev/null && pwd -P || printf '%s' "$child")"
+    parent="$(cd "$parent" 2>/dev/null && pwd -P || printf '%s' "$parent")"
+    [[ "$child" == "$parent" || "$child" == "$parent/"* ]]
+}
+
+assert_user_owned_global_install() {
+    local package_root
+    package_root="$(cd "${_post_install_dir}/.." 2>/dev/null && pwd -P || true)"
+    local global_prefix
+    global_prefix="$(npm prefix -g 2>/dev/null || true)"
+    local global_root
+    global_root="$(npm root -g 2>/dev/null || true)"
+    local preferred_prefix="${REAL_HOME}/.jishushell/npm-global"
+    local preferred_package="${npm_package_name:-jishushell}"
+
+    if [[ $EUID -eq 0 || "${REAL_USER:-}" == "root" || "${REAL_HOME:-}" == "/root" ]]; then
+        postinstall_print ""
+        postinstall_print "ERROR: JishuShell must not be installed as root."
+        postinstall_print ""
+        postinstall_print "Install it into the real user's npm prefix instead:"
+        postinstall_print ""
+        postinstall_print_white_bold "  npm install -g --prefix \"${preferred_prefix}\" ${preferred_package}"
+        postinstall_print "  # For a local tarball, replace ${preferred_package} with ./jishushell-<version>.tgz"
+        postinstall_print_white_bold "  sudo env JISHUSHELL_HOME=\"${JISHUSHELL_HOME}\" HOME=\"${REAL_HOME}\" \"${JISHUSHELL_BIN_DIR}/jishushell\" repair"
+        postinstall_print ""
+        exit 1
+    fi
+
+    case "$global_prefix" in
+        /usr|/usr/*|/usr/local|/usr/local/*|/opt|/opt/*|/root|/root/*)
+            postinstall_print ""
+            postinstall_print "ERROR: JishuShell global npm prefix is not user-owned:"
+            postinstall_print "  ${global_prefix}"
+            postinstall_print ""
+            postinstall_print "Install it into the current user's JishuShell npm prefix:"
+            postinstall_print ""
+            postinstall_print_white_bold "  npm install -g --prefix \"${preferred_prefix}\" ${preferred_package}"
+            postinstall_print "  # For a local tarball, replace ${preferred_package} with ./jishushell-<version>.tgz"
+            postinstall_print_white_bold "  sudo env JISHUSHELL_HOME=\"${JISHUSHELL_HOME}\" HOME=\"${REAL_HOME}\" \"${JISHUSHELL_BIN_DIR}/jishushell\" repair"
+            postinstall_print ""
+            exit 1
+            ;;
+    esac
+
+    if ! _postinstall_path_under "$package_root" "$REAL_HOME" && ! _postinstall_path_under "$global_root" "$REAL_HOME"; then
+        postinstall_print ""
+        postinstall_print "ERROR: JishuShell package was installed outside the real user's home:"
+        postinstall_print "  package: ${package_root:-unknown}"
+        postinstall_print "  npm root: ${global_root:-unknown}"
+        postinstall_print ""
+        postinstall_print "Install it into the current user's JishuShell npm prefix:"
+        postinstall_print ""
+        postinstall_print_white_bold "  npm install -g --prefix \"${preferred_prefix}\" ${preferred_package}"
+        postinstall_print "  # For a local tarball, replace ${preferred_package} with ./jishushell-<version>.tgz"
+        postinstall_print_white_bold "  sudo env JISHUSHELL_HOME=\"${JISHUSHELL_HOME}\" HOME=\"${REAL_HOME}\" \"${JISHUSHELL_BIN_DIR}/jishushell\" repair"
+        postinstall_print ""
+        exit 1
+    fi
+}
+
 # Skip steps handled by npm
 SKIP_NODE=1
 export JISHUSHELL_SKIP_NPM_INSTALL=1
 
 # Parse any extra args forwarded via npm (e.g. --dry-run, --yes, --skip-docker)
 parse_args "$@"
+assert_user_owned_global_install
 
-# ── Early privilege decision ──────────────────────────────────────────────────
-# npm runs postinstall for global installs, but npm 7+ may hide lifecycle stdout
-# unless --foreground-scripts is used.  We never attempt interactive sudo prompts
-# inside postinstall because npm's output buffering makes them invisible.
-#
-# Decision tree:
-#   - root (sudo npm install -g ...)      → proceed with full system setup
-#   - passwordless sudo available         → proceed with full system setup
-#   - non-root + service already exists   → package updated; print restart hint
-#   - non-root + first install            → print sudo hint
-#   - web update (JISHUSHELL_WEB_UPDATE)  → handled later by configure_postinstall_mode
-_JISHUSHELL_SERVICE_EXISTS=0
-if [[ -f "/etc/systemd/system/jishushell.service" ]] || \
-   [[ -f "${HOME}/Library/LaunchAgents/com.jishushell.panel.plist" ]]; then
-    _JISHUSHELL_SERVICE_EXISTS=1
-fi
-
-if [[ "${JISHUSHELL_WEB_UPDATE:-0}" != "1" && $EUID -ne 0 ]]; then
-    _HAS_PASSWORDLESS_SUDO=0
-    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
-        _HAS_PASSWORDLESS_SUDO=1
-    fi
-
-    if [[ "$_HAS_PASSWORDLESS_SUDO" == "0" ]]; then
-        backup_postinstall_scripts
-        _WRAPPERS_REFRESHED=0
-        if refresh_postinstall_wrappers_quiet; then
-            _WRAPPERS_REFRESHED=1
-        fi
-        # sudo resets PATH and HOME on many distros. Prefer the installed
-        # wrapper because it embeds the real user home and Node lookup logic.
-        _JISHU_BIN="${JISHUSHELL_BIN_DIR}/jishushell"
-        if [[ ! -x "$_JISHU_BIN" && -x "${JISHUSHELL_BIN_DIR}/jishushell-core-start" ]]; then
-            ln -sf "${JISHUSHELL_BIN_DIR}/jishushell-core-start" "$_JISHU_BIN" 2>/dev/null || {
-                cp "${JISHUSHELL_BIN_DIR}/jishushell-core-start" "$_JISHU_BIN" 2>/dev/null || true
-                chmod +x "$_JISHU_BIN" 2>/dev/null || true
-            }
-        fi
-        if [[ ! -x "$_JISHU_BIN" ]]; then
-            _JISHU_BIN="$(command -v jishushell 2>/dev/null || command -v jishushell 2>/dev/null || echo "jishushell")"
-        fi
-
-        if [[ "$_JISHUSHELL_SERVICE_EXISTS" == "1" ]]; then
-            # Upgrade: package files updated, but no sudo to restart services.
-            print_package_only_update_notice "sudo ${_JISHU_BIN} system reload" "$_WRAPPERS_REFRESHED"
-        else
-            # First install: cannot do system setup without root.
-            postinstall_print ""
-            postinstall_print "  ✓ JishuShell 包文件已安装。"
-            postinstall_print ""
-            postinstall_print "  首次安装需要 root 权限来配置系统服务。"
-            postinstall_print "  请执行："
-            postinstall_print "    sudo npm install -g <同一个 .tgz 路径>"
-            postinstall_print ""
-        fi
-        exit 0
-    fi
-fi
-
-# ── npm post-install privilege mode ───────────────────────────────────────────
-# npm lifecycle scripts need careful sudo handling:
-#   - when there is an interactive TTY, prompt explicitly on /dev/tty so the
-#     operator can finish system service reconciliation during install
-#   - when npm runs from the web updater, CI, or another non-TTY context, never
-#     block on sudo; finish the package update and print a clear follow-up action
-#
-# So postinstall performs privileged steps when it is root, has passwordless
-# sudo, or can visibly ask for sudo on /dev/tty. Otherwise it degrades to a
-# best-effort package refresh.
-POST_INSTALL_BEST_EFFORT=0
-print_postinstall_best_effort_notice() {
-    echo ""
-    echo -e "${WARN}${BOLD}Action required — system service was not refreshed${NC}"
-    echo -e "${WARN}  npm installed the JishuShell package files, but post-install did not run${NC}"
-    echo -e "${WARN}  privileged Docker/Nomad/systemd reconciliation because it could not${NC}"
-    echo -e "${WARN}  prompt for sudo in this environment.${NC}"
-    echo ""
-    echo -e "${WARN}  If this machine already runs JishuShell as a service, it may still be using${NC}"
-    echo -e "${WARN}  the previous code until you refresh it from a normal shell:${NC}"
-    echo -e "${ACCENT}    jishushell install --yes${NC}"
-    echo -e "${WARN}  Or, if the system service is already configured and only needs the new code:${NC}"
-    if jishushell_panel_bundled; then
-        echo -e "${ACCENT}    sudo systemctl restart jishushell jishushell-panel${NC}"
-    else
-        echo -e "${ACCENT}    sudo systemctl restart jishushell${NC}"
-    fi
-    echo ""
+is_jishushell_service_installed() {
+    [[ -f "/etc/systemd/system/jishushell.service" ]] && return 0
+    [[ -f "${REAL_HOME:-$HOME}/Library/LaunchAgents/com.jishushell.panel.plist" ]] && return 0
+    return 1
 }
 
-configure_postinstall_mode() {
-    # Web-triggered upgrade: npm was spawned by the panel backend without a
-    # controlling TTY.  Skip all privileged steps so npm can exit cleanly.
-    if [[ "${JISHUSHELL_WEB_UPDATE:-0}" == "1" ]]; then
-        POST_INSTALL_BEST_EFFORT=1
-        NO_PROMPT=1
-        SUDO=""
-        SKIP_DOCKER=1
-        SKIP_NOMAD=1
-        SKIP_OPENCLAW=1
-        SKIP_JISHUSHELL_SERVICE=1
-        return 0
-    fi
+postinstall_shell_quote() {
+    printf '%q' "$1"
+}
 
-    if [[ $EUID -eq 0 ]]; then
-        SUDO=""
-        return 0
+resolve_postinstall_cli_command() {
+    local jishu_bin="${JISHUSHELL_BIN_DIR}/jishushell"
+    if [[ ! -x "$jishu_bin" && -x "${JISHUSHELL_BIN_DIR}/jishushell-core-start" ]]; then
+        ln -sf "${JISHUSHELL_BIN_DIR}/jishushell-core-start" "$jishu_bin" 2>/dev/null || {
+            cp "${JISHUSHELL_BIN_DIR}/jishushell-core-start" "$jishu_bin" 2>/dev/null || true
+            chmod +x "$jishu_bin" 2>/dev/null || true
+        }
     fi
-
-    if ! command -v sudo &>/dev/null; then
-        POST_INSTALL_BEST_EFFORT=1
-        NO_PROMPT=1
-        SUDO=""
-        SKIP_DOCKER=1
-        SKIP_NOMAD=1
-        SKIP_OPENCLAW=1
-        SKIP_JISHUSHELL_SERVICE=1
-        return 0
+    if [[ ! -x "$jishu_bin" ]]; then
+        jishu_bin="$(command -v jishushell 2>/dev/null || echo "jishushell")"
     fi
+    printf '%s\n' "$jishu_bin"
+}
 
-    if sudo -n true 2>/dev/null; then
-        SUDO="sudo"
-        NO_PROMPT=1
-        return 0
-    fi
+build_postinstall_sudo_command() {
+    local jishu_bin="$1"
+    shift
+    printf 'sudo env JISHUSHELL_HOME=%s HOME=%s %s' \
+        "$(postinstall_shell_quote "${JISHUSHELL_HOME}")" \
+        "$(postinstall_shell_quote "${REAL_HOME}")" \
+        "$(postinstall_shell_quote "${jishu_bin}")"
+    local arg
+    for arg in "$@"; do
+        printf ' %s' "$(postinstall_shell_quote "${arg}")"
+    done
+    printf '\n'
+}
 
-    if _post_install_has_tty; then
-        SUDO="sudo"
-        NO_PROMPT=0
-        return 0
-    fi
+resolve_postinstall_repair_command() {
+    build_postinstall_sudo_command "$(resolve_postinstall_cli_command)" repair
+}
 
-    POST_INSTALL_BEST_EFFORT=1
-    NO_PROMPT=1
-    SUDO=""
-    SKIP_DOCKER=1
-    SKIP_NOMAD=1
-    SKIP_OPENCLAW=1
-    SKIP_JISHUSHELL_SERVICE=1
+resolve_postinstall_install_command() {
+    build_postinstall_sudo_command "$(resolve_postinstall_cli_command)" install
+}
+
+print_first_install_notice() {
+    local install_cmd="$1"
+    postinstall_print ""
+    postinstall_print "JishuShell package installed"
+    postinstall_print "---------------------------"
+    postinstall_print "✓ Package files updated"
+    postinstall_print ""
+    postinstall_print_yellow "════════════════════════════════════════════════════════════════════"
+    postinstall_print_yellow "  ⚠  FIRST INSTALL NOT CONFIGURED"
+    postinstall_print_yellow "     npm postinstall does not install Docker/Nomad or system services."
+    postinstall_print_yellow ""
+    postinstall_print_yellow "  Run the full installer to configure this machine:"
+    postinstall_print ""
+    postinstall_print_white_bold "       ${install_cmd}"
+    postinstall_print ""
+    postinstall_print_yellow "════════════════════════════════════════════════════════════════════"
+    postinstall_print ""
 }
 
 # ── Log setup ─────────────────────────────────────────────────────────────────
@@ -398,30 +385,20 @@ echo ""
 # ── Run install steps ─────────────────────────────────────────────────────────
 detect_os
 detect_arch
-configure_postinstall_mode
-if [[ "$POST_INSTALL_BEST_EFFORT" == "1" ]]; then
-    backup_postinstall_scripts
-    _WRAPPERS_REFRESHED=0
-    if refresh_postinstall_wrappers_quiet; then
-        _WRAPPERS_REFRESHED=1
-    fi
-    schedule_web_update_service_restart
-    _JISHU_BIN="${JISHUSHELL_BIN_DIR}/jishushell"
-    if [[ ! -x "$_JISHU_BIN" ]]; then
-        _JISHU_BIN="$(command -v jishushell 2>/dev/null || command -v jishushell 2>/dev/null || echo "jishushell")"
-    fi
-    print_package_only_update_notice "sudo ${_JISHU_BIN} system reload" "$_WRAPPERS_REFRESHED"
-    _rc=0
-else
-    check_sudo
-    ensure_prerequisites
-    if run_install_components --with-jishushell; then
-        _rc=0
-    else
-        _rc=$?
-    fi
-    show_summary --with-jishushell
+
+backup_postinstall_scripts
+_WRAPPERS_REFRESHED=0
+if refresh_postinstall_wrappers_quiet; then
+    _WRAPPERS_REFRESHED=1
 fi
+
+if is_jishushell_service_installed; then
+    write_package_update_pending_marker
+    print_package_only_update_notice "$(resolve_postinstall_repair_command)" "$_WRAPPERS_REFRESHED"
+else
+    print_first_install_notice "$(resolve_postinstall_install_command)"
+fi
+_rc=0
 
 # ── Persist uninstall scripts for postuninstall lifecycle hook ────────────────
 # npm removes package files BEFORE postuninstall runs, so we keep a copy in

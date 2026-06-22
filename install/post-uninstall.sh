@@ -101,6 +101,12 @@ if command -v systemctl >/dev/null 2>&1; then
         $_SUDO systemctl disable "$svc" 2>/dev/null || true
         $_SUDO rm -f "/etc/systemd/system/${svc}.service" 2>/dev/null || true
     done
+    if [ -L "/usr/local/bin/jishushell" ]; then
+        _jishu_link_target="$(readlink "/usr/local/bin/jishushell" 2>/dev/null || true)"
+        if [ "$_jishu_link_target" = "${JISHUSHELL_HOME}/bin/jishushell" ]; then
+            $_SUDO rm -f "/usr/local/bin/jishushell" 2>/dev/null || true
+        fi
+    fi
     $_SUDO systemctl daemon-reload 2>/dev/null || true
 fi
 

@@ -443,6 +443,14 @@ stop_services() {
                 fi
                 ${SUDO} rm -f "/etc/systemd/system/${svc}.service" 2>/dev/null || true
             done
+            if [[ -L "/usr/local/bin/jishushell" ]]; then
+                local _jishu_link_target
+                _jishu_link_target="$(readlink "/usr/local/bin/jishushell" 2>/dev/null || true)"
+                if [[ "$_jishu_link_target" == "${JISHUSHELL_HOME}/bin/jishushell" ]]; then
+                    ${SUDO} rm -f "/usr/local/bin/jishushell" 2>/dev/null || true
+                    ui_success "Removed: /usr/local/bin/jishushell"
+                fi
+            fi
             ${SUDO} systemctl daemon-reload 2>/dev/null || true
             ui_success "Services stopped and removed from auto-start"
         fi

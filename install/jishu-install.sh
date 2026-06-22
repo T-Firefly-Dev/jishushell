@@ -2298,9 +2298,8 @@ install_nomad_systemd() {
     _ensure_nomad_hcl
 
     # Nomad 1.6.5's docker driver fingerprint requires euid==0 (PR #18197 lifted
-    # the root requirement only in 1.7+, which is BSL). The panel stays as the
-    # installing user via a separate unit; it talks to this agent over HTTP so
-    # ~/.jishushell/nomad/data/ can be root-owned without breaking anything.
+    # the root requirement only in 1.7+, which is BSL). Core/Panel stay as the
+    # installing user via separate units and talk to this agent over HTTP.
     local service_content="[Unit]
 Description=Nomad Agent
 After=network-online.target docker.service
@@ -2332,12 +2331,9 @@ WantedBy=multi-user.target"
     ${SUDO} chown root:root "$svc_path" 2>/dev/null || true
     ${SUDO} chmod 644 "$svc_path" 2>/dev/null || true
 
-    # Keep the real user owning ~/.jishushell except for Nomad's own state,
-    # which must be root-owned because the agent runs as root for driver fingerprinting.
+    # Keep ~/.jishushell user-owned. Nomad runs as root, but root can write
+    # user-owned state; app and Core files must remain writable by REAL_USER.
     chown -R "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "${JISHUSHELL_HOME}" 2>/dev/null || true
-    if [[ -d "${nomad_config_dir}/data" ]]; then
-        ${SUDO} chown -R root:root "${nomad_config_dir}/data" 2>/dev/null || true
-    fi
 
     if [[ $need_reload -eq 1 ]]; then
         ${SUDO} systemctl daemon-reload
@@ -3104,14 +3100,15 @@ install_jishushell() {
     if [[ "$DRY_RUN" == "1" ]]; then
         local jishushell_pkg_spec
         jishushell_pkg_spec="$(jishushell_package_spec)"
+        local jishushell_npm_prefix="${JISHUSHELL_NPM_PREFIX:-${JISHUSHELL_HOME}/npm-global}"
         local _dry_reg=""
         [[ -n "${NPM_REGISTRY:-}" ]] && _dry_reg=" --registry ${NPM_REGISTRY}"
         local _dry_tgz=""
         _dry_tgz="$(find_local_jishushell_tgz 2>/dev/null || true)"
         if [[ -n "$_dry_tgz" ]]; then
-            ui_info "[dry-run] Would: npm install -g ${_dry_tgz}  (local package)"
+            ui_info "[dry-run] Would: npm install -g --prefix ${jishushell_npm_prefix} ${_dry_tgz}  (local package)"
         else
-            ui_info "[dry-run] Would: npm install -g ${jishushell_pkg_spec}${_dry_reg}"
+            ui_info "[dry-run] Would: npm install -g --prefix ${jishushell_npm_prefix} ${jishushell_pkg_spec}${_dry_reg}"
         fi
         ui_info "[dry-run] Would write wrapper: ${JISHUSHELL_BIN_DIR}/jishushell-core-start"
         if jishushell_panel_bundled || [[ "$(basename "${_dry_tgz:-}")" == jishushell-gui-*.tgz ]]; then
@@ -3147,6 +3144,7 @@ install_jishushell() {
 
     local jishushell_pkg_spec
     jishushell_pkg_spec="$(jishushell_package_spec)"
+    local jishushell_npm_prefix="${JISHUSHELL_NPM_PREFIX:-${JISHUSHELL_HOME}/npm-global}"
     local npm_registry_args=()
     if [[ -n "${NPM_REGISTRY:-}" ]]; then
         if [[ ! "$NPM_REGISTRY" =~ ^https?:// ]]; then
@@ -3164,6 +3162,7 @@ install_jishushell() {
     local tgz_path=""
     local expected_pkg_name
     if [[ "${JISHUSHELL_SKIP_NPM_INSTALL:-0}" != "1" ]]; then
+        mkdir -p "$jishushell_npm_prefix"
         # Prefer a local .tgz package in the same directory as this script.
         tgz_path="$(find_local_jishushell_tgz 2>/dev/null || true)"
         expected_pkg_name="$(jishushell_package_name_from_spec "${tgz_path:-$jishushell_pkg_spec}")"
@@ -3176,21 +3175,21 @@ install_jishushell() {
 
         if [[ -n "$tgz_path" ]]; then
             ui_info "Found local package: ${tgz_path} — installing offline..."
-            log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g ${tgz_path}"
-            if ! log_cmd "$npm_bin" install -g "${tgz_path}"; then
+            log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g --prefix ${jishushell_npm_prefix} ${tgz_path}"
+            if ! log_cmd "$npm_bin" install -g --prefix "$jishushell_npm_prefix" "${tgz_path}"; then
                 unset JISHU_RUNNING_IN_INSTALLER
                 ui_error "npm install -g ${tgz_path} failed"
                 return 1
             fi
         else
-            log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g ${jishushell_pkg_spec} ${npm_registry_args[*]:-}"
+            log_detail "[$(date '+%H:%M:%S')] ${npm_bin} install -g --prefix ${jishushell_npm_prefix} ${jishushell_pkg_spec} ${npm_registry_args[*]:-}"
             if [[ ${#npm_registry_args[@]} -gt 0 ]]; then
-                if ! log_cmd "$npm_bin" install -g "${jishushell_pkg_spec}" "${npm_registry_args[@]}"; then
+                if ! log_cmd "$npm_bin" install -g --prefix "$jishushell_npm_prefix" "${jishushell_pkg_spec}" "${npm_registry_args[@]}"; then
                     unset JISHU_RUNNING_IN_INSTALLER
                     ui_error "npm install -g ${jishushell_pkg_spec} failed"
                     return 1
                 fi
-            elif ! log_cmd "$npm_bin" install -g "${jishushell_pkg_spec}"; then
+            elif ! log_cmd "$npm_bin" install -g --prefix "$jishushell_npm_prefix" "${jishushell_pkg_spec}"; then
                 unset JISHU_RUNNING_IN_INSTALLER
                 ui_error "npm install -g ${jishushell_pkg_spec} failed"
                 return 1
@@ -3207,7 +3206,11 @@ install_jishushell() {
 
     # Resolve the installed cli.js path via the npm that did the install
     local npm_root
-    npm_root="$("$npm_bin" root -g 2>/dev/null || true)"
+    if [[ "${JISHUSHELL_SKIP_NPM_INSTALL:-0}" == "1" ]]; then
+        npm_root="$("$npm_bin" root -g 2>/dev/null || true)"
+    else
+        npm_root="$("$npm_bin" root -g --prefix "$jishushell_npm_prefix" 2>/dev/null || true)"
+    fi
     if [[ -z "$npm_root" ]]; then
         ui_error "Cannot locate npm root — wrapper cannot be written"
         return 1
@@ -3244,9 +3247,8 @@ set -euo pipefail
 _WRAPPER_PATH="\${BASH_SOURCE[0]:-\$0}"
 _WRAPPER_DIR="\$(cd "\$(dirname "\$_WRAPPER_PATH")" && pwd)"
 _DEFAULT_JISHUSHELL_HOME="\$(cd "\${_WRAPPER_DIR}/.." && pwd)"
-JISHUSHELL_HOME="\${JISHUSHELL_HOME:-\$_DEFAULT_JISHUSHELL_HOME}"
 
-_resolve_home() {
+_resolve_sudo_home() {
     if [ -n "\${SUDO_UID:-}" ] && command -v getent >/dev/null 2>&1; then
         local _entry
         _entry="\$(getent passwd "\$SUDO_UID" 2>/dev/null || true)"
@@ -3254,6 +3256,27 @@ _resolve_home() {
             printf '%s\n' "\$_entry" | cut -d: -f6
             return
         fi
+    fi
+}
+
+_SUDO_HOME="\$(_resolve_sudo_home || true)"
+if [ -z "\${JISHUSHELL_HOME:-}" ]; then
+    case "\$_DEFAULT_JISHUSHELL_HOME" in
+        /usr|/usr/local|/opt/homebrew|/opt/local)
+            if [ -n "\$_SUDO_HOME" ]; then
+                JISHUSHELL_HOME="\${_SUDO_HOME}/.jishushell"
+            else
+                JISHUSHELL_HOME="\$_DEFAULT_JISHUSHELL_HOME"
+            fi
+            ;;
+        *) JISHUSHELL_HOME="\$_DEFAULT_JISHUSHELL_HOME" ;;
+    esac
+fi
+
+_resolve_home() {
+    if [ -n "\$_SUDO_HOME" ]; then
+        printf '%s\n' "\$_SUDO_HOME"
+        return
     fi
     case "\$JISHUSHELL_HOME" in
         */.jishushell) printf '%s\n' "\${JISHUSHELL_HOME%/.jishushell}" ;;
@@ -3307,9 +3330,8 @@ set -euo pipefail
 _WRAPPER_PATH="\${BASH_SOURCE[0]:-\$0}"
 _WRAPPER_DIR="\$(cd "\$(dirname "\$_WRAPPER_PATH")" && pwd)"
 _DEFAULT_JISHUSHELL_HOME="\$(cd "\${_WRAPPER_DIR}/.." && pwd)"
-JISHUSHELL_HOME="\${JISHUSHELL_HOME:-\$_DEFAULT_JISHUSHELL_HOME}"
 
-_resolve_home() {
+_resolve_sudo_home() {
     if [ -n "\${SUDO_UID:-}" ] && command -v getent >/dev/null 2>&1; then
         local _entry
         _entry="\$(getent passwd "\$SUDO_UID" 2>/dev/null || true)"
@@ -3317,6 +3339,27 @@ _resolve_home() {
             printf '%s\n' "\$_entry" | cut -d: -f6
             return
         fi
+    fi
+}
+
+_SUDO_HOME="\$(_resolve_sudo_home || true)"
+if [ -z "\${JISHUSHELL_HOME:-}" ]; then
+    case "\$_DEFAULT_JISHUSHELL_HOME" in
+        /usr|/usr/local|/opt/homebrew|/opt/local)
+            if [ -n "\$_SUDO_HOME" ]; then
+                JISHUSHELL_HOME="\${_SUDO_HOME}/.jishushell"
+            else
+                JISHUSHELL_HOME="\$_DEFAULT_JISHUSHELL_HOME"
+            fi
+            ;;
+        *) JISHUSHELL_HOME="\$_DEFAULT_JISHUSHELL_HOME" ;;
+    esac
+fi
+
+_resolve_home() {
+    if [ -n "\$_SUDO_HOME" ]; then
+        printf '%s\n' "\$_SUDO_HOME"
+        return
     fi
     case "\$JISHUSHELL_HOME" in
         */.jishushell) printf '%s\n' "\${JISHUSHELL_HOME%/.jishushell}" ;;
@@ -3378,9 +3421,8 @@ set -euo pipefail
 _WRAPPER_PATH="\${BASH_SOURCE[0]:-\$0}"
 _WRAPPER_DIR="\$(cd "\$(dirname "\$_WRAPPER_PATH")" && pwd)"
 _DEFAULT_JISHUSHELL_HOME="\$(cd "\${_WRAPPER_DIR}/.." && pwd)"
-JISHUSHELL_HOME="\${JISHUSHELL_HOME:-\$_DEFAULT_JISHUSHELL_HOME}"
 
-_resolve_home() {
+_resolve_sudo_home() {
     if [ -n "\${SUDO_UID:-}" ] && command -v getent >/dev/null 2>&1; then
         local _entry
         _entry="\$(getent passwd "\$SUDO_UID" 2>/dev/null || true)"
@@ -3388,6 +3430,27 @@ _resolve_home() {
             printf '%s\n' "\$_entry" | cut -d: -f6
             return
         fi
+    fi
+}
+
+_SUDO_HOME="\$(_resolve_sudo_home || true)"
+if [ -z "\${JISHUSHELL_HOME:-}" ]; then
+    case "\$_DEFAULT_JISHUSHELL_HOME" in
+        /usr|/usr/local|/opt/homebrew|/opt/local)
+            if [ -n "\$_SUDO_HOME" ]; then
+                JISHUSHELL_HOME="\${_SUDO_HOME}/.jishushell"
+            else
+                JISHUSHELL_HOME="\$_DEFAULT_JISHUSHELL_HOME"
+            fi
+            ;;
+        *) JISHUSHELL_HOME="\$_DEFAULT_JISHUSHELL_HOME" ;;
+    esac
+fi
+
+_resolve_home() {
+    if [ -n "\$_SUDO_HOME" ]; then
+        printf '%s\n' "\$_SUDO_HOME"
+        return
     fi
     case "\$JISHUSHELL_HOME" in
         */.jishushell) printf '%s\n' "\${JISHUSHELL_HOME%/.jishushell}" ;;
@@ -3728,6 +3791,21 @@ WantedBy=multi-user.target"
     fi
 
     install_jishushell_panel_service || true
+
+    # The shell installer still has some legacy inline wrapper/unit templates.
+    # Run the Node-side system reload once at the end so the currently
+    # installed Core code rewrites host files to the same canonical templates
+    # that `system-reconciler` validates on the next startup.
+    local cli_wrapper="${JISHUSHELL_BIN_DIR}/jishushell"
+    if [[ -x "$cli_wrapper" ]]; then
+        if ${SUDO} env JISHUSHELL_HOME="${JISHUSHELL_HOME}" HOME="${REAL_HOME}" "$cli_wrapper" system reload; then
+            ui_success "System components reloaded with canonical templates"
+        else
+            ui_warn "System reload did not complete during install; run 'sudo ${cli_wrapper} system reload'"
+        fi
+    else
+        ui_warn "JishuShell CLI wrapper not found for final system reload; run 'sudo ${JISHUSHELL_BIN_DIR}/jishushell system reload'"
+    fi
 }
 
 # ─── run_install_components ───────────────────────────────────────────────────
@@ -3831,12 +3909,11 @@ run_install_components() {
     fi
 
     # ── Fix .jishushell ownership & permissions ───────────────────────────────
-    # Ensure the data dir is readable/writable by both root and the real user.
-    # - Root owns the dir (service runs as root)
-    # - REAL_USER is in the owning group; dirs are g+rwx so normal-user tools work
+    # Ensure the data dir is owned by the real user that runs Core/Panel.
+    # On Linux, Nomad itself still runs as root, but root can write user-owned
+    # state; keeping ~/.jishushell user-owned avoids app/Core permission drift.
     if [[ -d "${JISHUSHELL_HOME}" && -n "${REAL_USER}" ]]; then
         ui_info "Fixing ${JISHUSHELL_HOME} ownership for ${REAL_USER}..."
-        # Both Nomad and JishuShell now run as REAL_USER — make REAL_USER own everything
         ${SUDO} chown -R "${REAL_USER}:${REAL_GID:-${REAL_USER}}" "${JISHUSHELL_HOME}" 2>/dev/null || true
         # Dirs: rwxr-xr-x
         ${SUDO} find "${JISHUSHELL_HOME}" -type d -exec chmod 755 {} + 2>/dev/null || true
@@ -3856,6 +3933,10 @@ run_install_components() {
             local fp="${JISHUSHELL_HOME}/${f}"
             [[ -f "$fp" ]] && ${SUDO} chmod 600 "$fp" 2>/dev/null || true
         done
+        if [[ -d "${JISHUSHELL_HOME}/provider-credentials" ]]; then
+            ${SUDO} find "${JISHUSHELL_HOME}/provider-credentials" -mindepth 2 -maxdepth 2 \
+                -type f -name credentials.json -exec chmod 600 {} + 2>/dev/null || true
+        fi
         # Sync nomad.env from /etc/jishushell if missing in JISHUSHELL_HOME
         if [[ ! -f "${JISHUSHELL_HOME}/nomad.env" && -f /etc/jishushell/nomad.env ]]; then
             if [[ -n "${SUDO}" || -r /etc/jishushell/nomad.env ]]; then
