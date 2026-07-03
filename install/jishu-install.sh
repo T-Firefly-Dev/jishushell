@@ -2308,7 +2308,6 @@ Wants=network-online.target
 [Service]
 User=root
 Type=simple
-EnvironmentFile=-/etc/jishushell/nomad.env
 ExecStart=${nomad_bin} agent -config=${config_file}
 Restart=on-failure
 RestartSec=3
