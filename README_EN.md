@@ -4,7 +4,7 @@
 
 Recently, a buzzword has been echoing through the AI ecosystem: **OpenClaw** (often referred to as "Lobster"). To bring the "Lobster" local, many platforms and vendors are investing in related variants and tools. Among them, **Jishu Community** (Arm China) has released **JishuShell**: a tool designed to deploy the Lobster locally with a single click, making it easier for AI Agents to run natively.
 
-![8](./res/1.webp)
+![8](./res/1_en.png)
 
 Currently, **Firefly AIBOX-3576** and **AIBOX-3588** have successfully run JishuShell, providing powerful hardware support for the localization of the Lobster.
 
